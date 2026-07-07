@@ -34,6 +34,12 @@ enum StreamState: Equatable {
     case sessionEnded
 }
 
+enum StreamOverlayState: Equatable {
+    case none
+    case pauseMenu
+    case textEntry
+}
+
 // MARK: - Stream Statistics
 
 struct StreamStats {
@@ -147,6 +153,8 @@ final class GFNStreamController: NSObject {
     /// Incremented each time the user presses Menu while VideoSurfaceView is first responder.
     /// SwiftUI observes this via .onChange to toggle the HUD overlay.
     private(set) var menuPressCount: Int = 0
+    /// Incremented when the controller keyboard shortcut requests local text entry.
+    private(set) var textEntryRequestCount: Int = 0
 
     private var peerConnection: LKRTCPeerConnection?
     private var inputDataChannel: LKRTCDataChannel?
@@ -198,6 +206,9 @@ final class GFNStreamController: NSObject {
     var onReconnectNeeded: (() async -> SessionInfo?)?
     private var previousSelectedCandidatePairId = ""
     private var lastZoneRttFeedbackAt: Date?
+    private var overlayInputPaused = false
+    private var controllerTextEntryActive = false
+    private var replayInputPaused = false
 
     private static let factory: LKRTCPeerConnectionFactory = {
         LKRTCInitializeSSL()
@@ -347,6 +358,45 @@ final class GFNStreamController: NSObject {
         inputSender?.setPaused(paused)
     }
 
+    func setOverlayInputPaused(_ paused: Bool) {
+        overlayInputPaused = paused
+        syncInputPauseState()
+    }
+
+    func beginControllerTextEntry() {
+        guard state == .streaming, !controllerTextEntryActive else { return }
+        controllerTextEntryActive = true
+        replayInputPaused = false
+        syncInputPauseState()
+        textEntryRequestCount += 1
+    }
+
+    func cancelControllerTextEntry() {
+        controllerTextEntryActive = false
+        replayInputPaused = false
+        syncInputPauseState()
+    }
+
+    func submitControllerTextEntry(_ text: String) {
+        guard let inputSender else {
+            controllerTextEntryActive = false
+            replayInputPaused = false
+            syncInputPauseState()
+            return
+        }
+
+        controllerTextEntryActive = false
+        replayInputPaused = true
+        syncInputPauseState()
+
+        inputSender.replaySubmittedText(text) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.replayInputPaused = false
+                self?.syncInputPauseState()
+            }
+        }
+    }
+
     // MARK: Fail (external error surfacing)
 
     func fail(with message: String) {
@@ -394,6 +444,7 @@ final class GFNStreamController: NSObject {
         videoView = nil
         remoteMode = .mouse
         menuPressCount = 0
+        textEntryRequestCount = 0
         timeWarning = nil
         videoDiagnostics = VideoPipelineSnapshot()
         colorState = StreamColorState(
@@ -405,6 +456,9 @@ final class GFNStreamController: NSObject {
             fallbackReason: nil
         )
         diagnosticSessionSummary = ""
+        overlayInputPaused = false
+        controllerTextEntryActive = false
+        replayInputPaused = false
         state = .idle
     }
 
@@ -1530,11 +1584,21 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
                 self?.remoteMode = mode
                 self?.videoView?.gamepadModeActive = (mode == .gamepad || mode == .dualsense)
             }
+            sender.controllerKeyboardShortcutHandler = { [weak self] in
+                self?.beginControllerTextEntry()
+            }
             sender.start()
             inputSender = sender
             // Forward keyboard/mouse events from the video surface to the sender
             videoView?.inputHandler = sender
+            syncInputPauseState()
         }
+    }
+}
+
+private extension GFNStreamController {
+    func syncInputPauseState() {
+        inputSender?.setPaused(overlayInputPaused || controllerTextEntryActive || replayInputPaused)
     }
 }
 
