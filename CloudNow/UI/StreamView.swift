@@ -24,11 +24,13 @@ struct StreamView: View {
     @Environment(AuthManager.self) var authManager
     @Environment(GamesViewModel.self) var viewModel
     @State private var streamController = GFNStreamController()
-    @State private var showOverlay = false
+    @State private var overlayState: StreamOverlayState = .none
     @State private var showExitConfirmation = false
     @State private var loadingPhase: LoadingPhase = .finding
     @State private var createdSession: SessionInfo?
     @State private var sessionToken: String?
+    @State private var textEntryText = ""
+    @FocusState private var textEntryFocused: Bool
     /// Per-ad state tracking to avoid duplicate reports
     @State private var adReportedAction: [String: AdAction] = [:]
 
@@ -65,7 +67,10 @@ struct StreamView: View {
         // signaling us through menuPressCount. .onExitCommand only fires in non-streaming states
         // (loading, error) when the focus engine is active.
         .onChange(of: streamController.menuPressCount) { _, _ in
-            toggleOverlay()
+            togglePauseMenu()
+        }
+        .onChange(of: streamController.textEntryRequestCount) { _, _ in
+            presentControllerTextEntry()
         }
         .onExitCommand {
             if streamController.state != .streaming {
@@ -74,7 +79,7 @@ struct StreamView: View {
         }
         .onPlayPauseCommand {
             guard streamController.state == .streaming else { return }
-            toggleOverlay()
+            togglePauseMenu()
         }
     }
 
@@ -146,26 +151,30 @@ struct StreamView: View {
 
     private var streamingView: some View {
         ZStack {
-            VideoSurfaceViewRepresentable(streamController: streamController, showOverlay: showOverlay)
+            VideoSurfaceViewRepresentable(streamController: streamController, showOverlay: overlayState != .none)
                 .ignoresSafeArea()
 
-            if showOverlay {
+            if overlayState == .pauseMenu {
                 pauseMenu
                     .transition(.opacity)
             }
 
-            if let warning = streamController.timeWarning, !showOverlay {
+            if overlayState == .textEntry {
+                controllerTextEntryOverlay
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
+
+            if let warning = streamController.timeWarning, overlayState == .none {
                 timeWarningBanner(warning)
                     .transition(.move(edge: .top).combined(with: .opacity))
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
         .animation(.easeInOut(duration: 0.4), value: streamController.timeWarning)
-        .animation(.easeInOut(duration: 0.2), value: showOverlay)
-        .onChange(of: showOverlay) { _, showing in
-            // Pause game input while overlay is open in gamepad mode so D-pad
-            // navigates overlay buttons instead of moving the in-game character.
-            streamController.setInputPaused(showing && streamController.remoteMode != .mouse)
+        .animation(.easeInOut(duration: 0.2), value: overlayState)
+        .onChange(of: overlayState) { _, state in
+            streamController.setOverlayInputPaused(state != .none)
+            textEntryFocused = state == .textEntry
         }
         .alert(L10n.text("end_session_title"), isPresented: $showExitConfirmation) {
             Button(L10n.text("end_session"), role: .destructive) { disconnect() }
@@ -182,7 +191,7 @@ struct StreamView: View {
             // Actions
             VStack(spacing: 16) {
                 Button {
-                    toggleOverlay()
+                    closeOverlay()
                 } label: {
                     Label(L10n.text("resume"), systemImage: "play.fill")
                         .frame(minWidth: 180)
@@ -303,6 +312,46 @@ struct StreamView: View {
         .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 16))
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
         .padding(60)
+    }
+
+    private var controllerTextEntryOverlay: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(L10n.text("controller_text_entry_title"))
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.white)
+
+            Text(L10n.text("controller_text_entry_instructions"))
+                .font(.body)
+                .foregroundStyle(.secondary)
+
+            TextField(L10n.text("controller_text_entry_placeholder"), text: $textEntryText)
+                .textFieldStyle(.roundedBorder)
+                .focused($textEntryFocused)
+                .onSubmit {
+                    submitControllerTextEntry()
+                }
+
+            HStack(spacing: 20) {
+                Button(L10n.text("cancel")) {
+                    cancelControllerTextEntry()
+                }
+                .buttonStyle(.bordered)
+
+                Button(L10n.text("controller_text_entry_send")) {
+                    submitControllerTextEntry()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(textEntryText.isEmpty)
+            }
+        }
+        .frame(maxWidth: 620)
+        .padding(32)
+        .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .stroke(.white.opacity(0.16), lineWidth: 1)
+        }
+        .shadow(color: .black.opacity(0.35), radius: 30, y: 12)
     }
 
     private var diagnosticRows: some View {
@@ -834,6 +883,7 @@ struct StreamView: View {
     /// Leaves the stream locally without stopping the server session.
     /// GFN keeps the session alive for ~1–2 minutes so it can be resumed from home.
     private func leave() {
+        overlayState = .none
         if let session = createdSession {
             onLeave?(game, session)
         }
@@ -842,6 +892,7 @@ struct StreamView: View {
     }
 
     private func disconnect() {
+        overlayState = .none
         // Intentional end — clear any pending resumable session
         viewModel.resumableSession = nil
         viewModel.clearLastSession()
@@ -923,10 +974,31 @@ struct StreamView: View {
         }
     }
 
-    private func toggleOverlay() {
-        showOverlay.toggle()
-        // Pause input forwarding while the overlay is visible so swipes don't move
-        // the game cursor and keyboard shortcuts don't reach the game accidentally.
-        streamController.setInputPaused(showOverlay)
+    private func togglePauseMenu() {
+        guard overlayState != .textEntry else { return }
+        overlayState = overlayState == .pauseMenu ? .none : .pauseMenu
+    }
+
+    private func closeOverlay() {
+        overlayState = .none
+    }
+
+    private func presentControllerTextEntry() {
+        guard streamController.state == .streaming, overlayState == .none else { return }
+        textEntryText = ""
+        overlayState = .textEntry
+    }
+
+    private func cancelControllerTextEntry() {
+        overlayState = .none
+        textEntryText = ""
+        streamController.cancelControllerTextEntry()
+    }
+
+    private func submitControllerTextEntry() {
+        let text = textEntryText
+        overlayState = .none
+        textEntryText = ""
+        streamController.submitControllerTextEntry(text)
     }
 }
