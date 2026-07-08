@@ -1574,6 +1574,7 @@ extension GFNStreamController: LKRTCDataChannelDelegate {
                 protocolVersion: negotiatedVersion,
                 deadzone: Float(settings.controllerDeadzone),
                 overlayTriggerButton: settings.overlayTriggerButton,
+                textInputTriggerSequence: settings.textInputTriggerSequence,
                 steamOverlayGestureEnabled: settings.enableSteamOverlayGesture,
                 remoteMode: settings.defaultRemoteInputMode
             )
