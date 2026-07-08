@@ -412,6 +412,11 @@ final class InputSender {
         var replayTapOnExpiry = false
     }
 
+    private struct KeyboardShortcutResolution {
+        let buttons: UInt16
+        let suppressesOptionsGestures: Bool
+    }
+
     private struct GamepadSnapshot: Equatable {
         let buttons: UInt16
         let leftTrigger: UInt8
@@ -793,8 +798,18 @@ final class InputSender {
         var state = mapGCControllerToXInput(controller, deadzone: deadzone)
         lastButtons[slot] = state.buttons
 
+        let shortcutResolution = applyKeyboardShortcutState(
+            buttons: state.buttons,
+            controller: controller,
+            slot: slot,
+            now: now
+        )
+        state.buttons = shortcutResolution.buttons
+
         if sampleOverlay {
-            if isOverlayButtonHeld(on: controller) {
+            if shortcutResolution.suppressesOptionsGestures && overlayTriggerButton == .options {
+                overlayPresses[slot] = nil
+            } else if isOverlayButtonHeld(on: controller) {
                 var press = overlayPresses[slot] ?? OverlayPressState()
                 press.ticks += 1
                 if !press.triggered, press.ticks >= Self.overlayLongPressThreshold {
@@ -806,7 +821,10 @@ final class InputSender {
                 finishOverlayPress(for: controller, slot: slot)
             }
 
-            if steamOverlayGestureEnabled, isSteamButtonHeld(on: controller) {
+            if shortcutResolution.suppressesOptionsGestures && overlayTriggerButton == .start {
+                steamHoldTicks[slot] = nil
+                steamTriggeredSlots.remove(slot)
+            } else if steamOverlayGestureEnabled, isSteamButtonHeld(on: controller) {
                 let ticks = (steamHoldTicks[slot] ?? 0) + 1
                 steamHoldTicks[slot] = ticks
                 if ticks >= Self.steamLongPressThreshold,
@@ -819,13 +837,6 @@ final class InputSender {
                 steamTriggeredSlots.remove(slot)
             }
         }
-
-        state.buttons = applyKeyboardShortcutState(
-            buttons: state.buttons,
-            controller: controller,
-            slot: slot,
-            now: now
-        )
 
         // The trigger is withheld for the entire gesture. A short press is replayed
         // as down/up on release; a long press is consumed by the local overlay.
@@ -961,25 +972,32 @@ final class InputSender {
         controller: GCController,
         slot: Int,
         now: UInt64
-    ) -> UInt16 {
-        let shortcutButtons = buttons & keyboardShortcutMask
+    ) -> KeyboardShortcutResolution {
+        let shortcutButtons = physicalKeyboardShortcutButtons(on: controller)
         if var state = keyboardShortcutStates[slot] {
             state.pendingButtons |= shortcutButtons
+            let suppressesOptionsGestures = state.pendingButtons & GFNInput.back != 0
 
             if state.triggered {
                 if shortcutButtons == 0 {
                     keyboardShortcutStates[slot] = nil
-                    return buttons
+                    return KeyboardShortcutResolution(buttons: buttons, suppressesOptionsGestures: false)
                 }
                 keyboardShortcutStates[slot] = state
-                return buttons & ~keyboardShortcutMask
+                return KeyboardShortcutResolution(
+                    buttons: buttons & ~keyboardShortcutMask,
+                    suppressesOptionsGestures: suppressesOptionsGestures
+                )
             }
 
             if shortcutButtons == keyboardShortcutMask {
                 state.triggered = true
                 keyboardShortcutStates[slot] = state
                 notifyControllerKeyboardShortcut()
-                return buttons & ~keyboardShortcutMask
+                return KeyboardShortcutResolution(
+                    buttons: buttons & ~keyboardShortcutMask,
+                    suppressesOptionsGestures: true
+                )
             }
 
             if shortcutButtons == 0 {
@@ -989,21 +1007,30 @@ final class InputSender {
             if now >= state.deadline {
                 keyboardShortcutStates[slot] = nil
                 if state.replayTapOnExpiry {
+                    let replayButtons = keyboardShortcutReplayButtons(for: state.pendingButtons)
                     sendKeyboardShortcutTap(
                         controller: controller,
                         slot: slot,
-                        shortcutButtons: state.pendingButtons
+                        shortcutButtons: replayButtons
                     )
-                    return buttons & ~keyboardShortcutMask
+                    return KeyboardShortcutResolution(
+                        buttons: buttons & ~keyboardShortcutMask,
+                        suppressesOptionsGestures: false
+                    )
                 }
-                return buttons
+                return KeyboardShortcutResolution(buttons: buttons, suppressesOptionsGestures: false)
             }
 
             keyboardShortcutStates[slot] = state
-            return buttons & ~keyboardShortcutMask
+            return KeyboardShortcutResolution(
+                buttons: buttons & ~keyboardShortcutMask,
+                suppressesOptionsGestures: suppressesOptionsGestures
+            )
         }
 
-        guard shortcutButtons != 0 else { return buttons }
+        guard shortcutButtons != 0 else {
+            return KeyboardShortcutResolution(buttons: buttons, suppressesOptionsGestures: false)
+        }
 
         if shortcutButtons == keyboardShortcutMask {
             notifyControllerKeyboardShortcut()
@@ -1012,14 +1039,20 @@ final class InputSender {
                 deadline: now &+ Self.keyboardShortcutGraceWindow,
                 triggered: true
             )
-            return buttons & ~keyboardShortcutMask
+            return KeyboardShortcutResolution(
+                buttons: buttons & ~keyboardShortcutMask,
+                suppressesOptionsGestures: true
+            )
         }
 
         keyboardShortcutStates[slot] = KeyboardShortcutState(
             pendingButtons: shortcutButtons,
             deadline: now &+ Self.keyboardShortcutGraceWindow
         )
-        return buttons & ~keyboardShortcutMask
+        return KeyboardShortcutResolution(
+            buttons: buttons & ~keyboardShortcutMask,
+            suppressesOptionsGestures: shortcutButtons & GFNInput.back != 0
+        )
     }
 
     private func sendKeyboardShortcutTap(
@@ -1027,6 +1060,7 @@ final class InputSender {
         slot: Int,
         shortcutButtons: UInt16
     ) {
+        guard shortcutButtons != 0 else { return }
         let state = mapGCControllerToXInput(controller, deadzone: deadzone)
         let baseButtons = state.buttons & ~keyboardShortcutMask
         let base = GamepadSnapshot(
@@ -1106,6 +1140,22 @@ final class InputSender {
 
     private var keyboardShortcutMask: UInt16 {
         GFNInput.back | GFNInput.buttonY
+    }
+
+    private func physicalKeyboardShortcutButtons(on controller: GCController) -> UInt16 {
+        guard let pad = controller.extendedGamepad else { return 0 }
+        var buttons: UInt16 = 0
+        if pad.buttonOptions?.isPressed == true { buttons |= GFNInput.back }
+        if pad.buttonY.isPressed { buttons |= GFNInput.buttonY }
+        return buttons
+    }
+
+    private func keyboardShortcutReplayButtons(for pendingButtons: UInt16) -> UInt16 {
+        var replayButtons = pendingButtons
+        if overlayTriggerButton == .options {
+            replayButtons &= ~GFNInput.back
+        }
+        return replayButtons
     }
 
     private func isOverlayButtonHeld(on controller: GCController) -> Bool {
