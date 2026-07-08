@@ -495,7 +495,6 @@ final class InputSender {
     private static let overlayLongPressThreshold = 216
     private static let steamLongPressThreshold = 120
     private static let microGamepadSuppressionWindow = UInt64(100_000_000)
-    private static let keyboardShortcutGraceWindow = UInt64(125_000_000)
     private static let replayEventIntervalMs: Int = 18
 
     init(channel: DataChannelSender) {
@@ -980,6 +979,7 @@ final class InputSender {
         slot: Int,
         now: UInt64
     ) -> KeyboardShortcutResolution {
+        let shortcutGraceWindow = UInt64(textInputTriggerDelayMs) * 1_000_000
         let shortcutButtons = physicalKeyboardShortcutButtons(on: controller)
         if var state = keyboardShortcutStates[slot] {
             state.pendingButtons.formUnion(shortcutButtons)
@@ -1059,7 +1059,7 @@ final class InputSender {
             notifyControllerKeyboardShortcut()
             keyboardShortcutStates[slot] = KeyboardShortcutState(
                 pendingButtons: shortcutButtons,
-                deadline: now &+ Self.keyboardShortcutGraceWindow,
+                deadline: now &+ shortcutGraceWindow,
                 triggered: true
             )
             return KeyboardShortcutResolution(
@@ -1071,7 +1071,7 @@ final class InputSender {
 
         keyboardShortcutStates[slot] = KeyboardShortcutState(
             pendingButtons: shortcutButtons,
-            deadline: now &+ Self.keyboardShortcutGraceWindow
+            deadline: now &+ shortcutGraceWindow
         )
         return KeyboardShortcutResolution(
             buttons: buttons & ~keyboardShortcutMask(for: shortcutButtons),
