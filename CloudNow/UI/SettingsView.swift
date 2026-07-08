@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 
 struct SettingsView: View {
@@ -5,6 +6,7 @@ struct SettingsView: View {
     @Environment(GamesViewModel.self) var viewModel
 
     @State private var showZonePicker = false
+    @State private var showTextInputSequenceCapture = false
 
     var body: some View {
         @Bindable var vm = viewModel
@@ -217,6 +219,23 @@ struct SettingsView: View {
                         }
                         .padding(.vertical, 8)
                     }
+                    Button {
+                        showTextInputSequenceCapture = true
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(L10n.text("text_input_buttons"))
+                                Text(L10n.text("text_input_buttons_description"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 8)
+                            Spacer()
+                            Text(vm.streamSettings.textInputTriggerSequence.label)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .foregroundStyle(.primary)
                     Toggle(isOn: $vm.streamSettings.enableSteamOverlayGesture) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(L10n.text("steam_overlay_gesture"))
@@ -303,6 +322,13 @@ struct SettingsView: View {
             .sheet(isPresented: $showZonePicker) {
                 ZonePickerView(selectedZoneUrl: $vm.streamSettings.preferredZoneUrl)
             }
+            .sheet(isPresented: $showTextInputSequenceCapture) {
+                TextInputTriggerSequenceCaptureSheet(
+                    sequence: $vm.streamSettings.textInputTriggerSequence,
+                    overlayTriggerButton: vm.streamSettings.overlayTriggerButton,
+                    steamOverlayGestureEnabled: vm.streamSettings.enableSteamOverlayGesture
+                )
+            }
         }
     }
 
@@ -323,6 +349,191 @@ struct SettingsView: View {
 
     private func statsModeDescription(_ mode: StreamStatsMode) -> String {
         L10n.streamStatsModeDescription(mode)
+    }
+}
+
+private struct TextInputTriggerSequenceCaptureSheet: View {
+    @Binding var sequence: ControllerButtonSequence
+    let overlayTriggerButton: OverlayTriggerButton
+    let steamOverlayGestureEnabled: Bool
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var capturePhase: CapturePhase = .waiting
+    @State private var liveButtons = Set<ControllerSequenceButton>()
+    @State private var lastDetectedSequence: ControllerButtonSequence?
+    @State private var validationMessage: String?
+
+    private enum CapturePhase {
+        case waiting
+        case collecting
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    LabeledContent(
+                        L10n.text("current_sequence"),
+                        value: sequence.label
+                    )
+                }
+
+                Section {
+                    Text(L10n.text("capture_text_input_buttons_instructions"))
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+
+                    Text(statusText)
+                        .foregroundStyle(.primary)
+
+                    if let detectedSequence {
+                        LabeledContent(
+                            L10n.text("detected_sequence"),
+                            value: detectedSequence.label
+                        )
+                    }
+
+                    if let validationMessage {
+                        Text(validationMessage)
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+            .navigationTitle(L10n.text("capture_text_input_buttons"))
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(L10n.text("cancel")) {
+                        dismiss()
+                    }
+                }
+            }
+            .task {
+                await monitorControllerButtons()
+            }
+        }
+    }
+
+    private var statusText: String {
+        switch capturePhase {
+        case .waiting:
+            L10n.text("press_buttons_now")
+        case .collecting:
+            L10n.text("release_buttons_to_save")
+        }
+    }
+
+    private var detectedSequence: ControllerButtonSequence? {
+        if !liveButtons.isEmpty {
+            return ControllerButtonSequence(buttons: Array(liveButtons))
+        }
+        return lastDetectedSequence
+    }
+
+    @MainActor
+    private func updateCapture(with pressedButtons: Set<ControllerSequenceButton>) {
+        switch capturePhase {
+        case .waiting:
+            guard !pressedButtons.isEmpty else { return }
+            capturePhase = .collecting
+            validationMessage = nil
+            liveButtons = pressedButtons
+            lastDetectedSequence = ControllerButtonSequence(buttons: Array(pressedButtons))
+
+        case .collecting:
+            if !pressedButtons.isEmpty {
+                liveButtons.formUnion(pressedButtons)
+                lastDetectedSequence = ControllerButtonSequence(buttons: Array(liveButtons))
+                return
+            }
+            finalizeCapture()
+        }
+    }
+
+    @MainActor
+    private func finalizeCapture() {
+        let capturedSequence = ControllerButtonSequence(buttons: Array(liveButtons))
+        liveButtons.removeAll()
+        capturePhase = .waiting
+
+        if let validationMessage = validationMessage(for: capturedSequence) {
+            self.validationMessage = validationMessage
+            lastDetectedSequence = capturedSequence
+            return
+        }
+
+        sequence = capturedSequence
+        dismiss()
+    }
+
+    private func validationMessage(for capturedSequence: ControllerButtonSequence) -> String? {
+        guard !capturedSequence.isEmpty else {
+            return L10n.text("button_sequence_empty")
+        }
+        guard capturedSequence.count <= ControllerButtonSequence.maxButtons else {
+            return L10n.text("button_sequence_too_long")
+        }
+        if capturedSequence.count == 1, capturedSequence.contains(overlayConflictButton) {
+            return L10n.text("button_sequence_conflicts_overlay")
+        }
+        if steamOverlayGestureEnabled,
+           capturedSequence.count == 1,
+           capturedSequence.contains(steamConflictButton)
+        {
+            return L10n.text("button_sequence_conflicts_steam")
+        }
+        return nil
+    }
+
+    private var overlayConflictButton: ControllerSequenceButton {
+        switch overlayTriggerButton {
+        case .start:
+            .menu
+        case .options:
+            .options
+        }
+    }
+
+    private var steamConflictButton: ControllerSequenceButton {
+        switch overlayTriggerButton {
+        case .start:
+            .options
+        case .options:
+            .menu
+        }
+    }
+
+    private func monitorControllerButtons() async {
+        while !Task.isCancelled {
+            let pressedButtons = currentPressedButtons()
+            await MainActor.run {
+                updateCapture(with: pressedButtons)
+            }
+            try? await Task.sleep(for: .milliseconds(16))
+        }
+    }
+
+    private func currentPressedButtons() -> Set<ControllerSequenceButton> {
+        guard let pad = GCController.controllers().compactMap(\.extendedGamepad).first else {
+            return []
+        }
+
+        var pressedButtons = Set<ControllerSequenceButton>()
+        if pad.dpad.up.isPressed { pressedButtons.insert(.dpadUp) }
+        if pad.dpad.down.isPressed { pressedButtons.insert(.dpadDown) }
+        if pad.dpad.left.isPressed { pressedButtons.insert(.dpadLeft) }
+        if pad.dpad.right.isPressed { pressedButtons.insert(.dpadRight) }
+        if pad.buttonA.isPressed { pressedButtons.insert(.buttonA) }
+        if pad.buttonB.isPressed { pressedButtons.insert(.buttonB) }
+        if pad.buttonX.isPressed { pressedButtons.insert(.buttonX) }
+        if pad.buttonY.isPressed { pressedButtons.insert(.buttonY) }
+        if pad.buttonMenu.isPressed { pressedButtons.insert(.menu) }
+        if pad.buttonOptions?.isPressed == true { pressedButtons.insert(.options) }
+        if pad.leftShoulder.isPressed { pressedButtons.insert(.leftShoulder) }
+        if pad.rightShoulder.isPressed { pressedButtons.insert(.rightShoulder) }
+        if pad.leftThumbstickButton?.isPressed == true { pressedButtons.insert(.leftThumbstick) }
+        if pad.rightThumbstickButton?.isPressed == true { pressedButtons.insert(.rightThumbstick) }
+        return pressedButtons
     }
 }
 
