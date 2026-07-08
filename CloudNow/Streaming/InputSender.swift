@@ -460,6 +460,7 @@ final class InputSender {
     private var deadzone: Float = 0.15
     private var overlayTriggerButton: OverlayTriggerButton = .start
     private var textInputTriggerSequence = StreamSettings.defaultTextInputTriggerSequence
+    private var textInputTriggerDelayMs = StreamSettings.defaultTextInputTriggerDelayMs
     private var steamOverlayGestureEnabled = true
     private var isPaused = false
 
@@ -555,6 +556,7 @@ final class InputSender {
         deadzone: Float,
         overlayTriggerButton: OverlayTriggerButton,
         textInputTriggerSequence: ControllerButtonSequence,
+        textInputTriggerDelayMs: Int,
         steamOverlayGestureEnabled: Bool,
         remoteMode: RemoteInputMode
     ) {
@@ -563,6 +565,7 @@ final class InputSender {
             self.deadzone = deadzone
             self.overlayTriggerButton = overlayTriggerButton
             self.textInputTriggerSequence = textInputTriggerSequence
+            self.textInputTriggerDelayMs = textInputTriggerDelayMs
             self.steamOverlayGestureEnabled = steamOverlayGestureEnabled
             self.remoteMode = remoteMode
         }
