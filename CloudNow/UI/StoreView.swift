@@ -34,7 +34,6 @@ struct StoreView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
             if games.isEmpty, viewModel.isLoading {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 40) {
@@ -148,7 +147,7 @@ struct StoreView: View {
                 .foregroundStyle(.secondary)
             Text(viewModel.error != nil ? L10n.text("failed_to_load_games") : L10n.text("no_games_available"))
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
             if let err = viewModel.error {
                 Text(err)
                     .font(.caption)

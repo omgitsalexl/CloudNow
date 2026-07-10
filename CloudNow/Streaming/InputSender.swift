@@ -15,6 +15,8 @@ private enum GFNInput {
     static let mouseBtnUp: UInt8 = 9
     static let mouseWheel: UInt8 = 10
     static let gamepad: UInt8 = 12
+    /// INPUT_HAPTICS_ENABLED
+    static let hapticsEnabled: UInt8 = 13
     /// Heartbeat type (u32 LE value 2) — keeps the server's virtual gamepad alive
     static let heartbeatU32: UInt32 = 2
 
@@ -71,6 +73,7 @@ enum InputPacketCategory: String {
     case mouseButton
     case mouseMove
     case mouseWheel
+    case hapticsEnabled
 }
 
 enum InputSendDisposition {
@@ -202,6 +205,17 @@ final class InputEncoder {
         writeUInt16BE(buf, offset: payloadOffset + 6, value: modifiers)
         writeUInt16BE(buf, offset: payloadOffset + 8, value: scancode)
         writeTimestampBE(buf, offset: payloadOffset + 10, value: timestamp)
+    }
+
+    /// Tells GFN the client supports controller haptics; GFN sends NO rumble until this is sent.
+    /// 6-byte body: [u32 LE type=13][u16 BE enable]; v3 wraps via writeSingleEventHeader (0x23/ts/0x22).
+    func encodeHapticsEnabled(_ enabled: Bool, into packet: EncodedInputPacket) {
+        let timestamp = currentTimestamp()
+        let payloadOffset = protocolVersion >= 3 ? 10 : 0
+        let buf = packet.prepare(length: payloadOffset + 6)
+        writeSingleEventHeader(buf, timestamp: timestamp)
+        writeUInt32LE(buf, offset: payloadOffset, value: UInt32(GFNInput.hapticsEnabled))
+        writeUInt16BE(buf, offset: payloadOffset + 4, value: enabled ? 1 : 0)
     }
 
     // MARK: Mouse Move
@@ -467,6 +481,10 @@ final class InputSender {
     private var extendedControllers: [GCController] = []
     private var microControllers: [GCController] = []
     private var controllerSlots: [ObjectIdentifier: Int] = [:]
+    private var haptics: [Int: ControllerHaptics] = [:]
+    private var rumbleEnabled = true
+    private var rumbleIntensity: Float = 1.0
+    private var hapticsAdvertised = false
     private var gamepadBitmap: UInt16 = 0
     private var lastButtons: [Int: UInt16] = [:]
     private var lastSnapshots: [Int: GamepadSnapshot] = [:]
@@ -517,6 +535,7 @@ final class InputSender {
                 notifyRemoteModeChanged()
             }
 
+            advertiseHaptics(rumbleEnabled && !haptics.isEmpty)
             lastHeartbeat = DispatchTime.now().uptimeNanoseconds
             let timer = DispatchSource.makeTimerSource(queue: inputQueue)
             timer.schedule(
@@ -544,6 +563,8 @@ final class InputSender {
                 extendedController.playerIndex = .indexUnset
             }
             microControllers.forEach(clearControllerHandlers)
+            haptics.values.forEach { $0.cleanup() }
+            haptics.removeAll()
             GCMouse.mice().forEach(clearMouseHandlers)
             extendedControllers.removeAll()
             microControllers.removeAll()
@@ -557,7 +578,9 @@ final class InputSender {
         textInputTriggerSequence: ControllerButtonSequence,
         textInputTriggerDelayMs: Int,
         steamOverlayGestureEnabled: Bool,
-        remoteMode: RemoteInputMode
+        remoteMode: RemoteInputMode,
+        rumbleEnabled: Bool = true,
+        rumbleIntensity: Float = 1.0
     ) {
         inputQueue.sync {
             encoder.setProtocolVersion(protocolVersion)
@@ -567,6 +590,9 @@ final class InputSender {
             self.textInputTriggerDelayMs = textInputTriggerDelayMs
             self.steamOverlayGestureEnabled = steamOverlayGestureEnabled
             self.remoteMode = remoteMode
+            self.rumbleEnabled = rumbleEnabled
+            self.rumbleIntensity = rumbleIntensity
+            haptics.values.forEach { $0.intensityScale = rumbleIntensity }
         }
     }
 
@@ -590,9 +616,18 @@ final class InputSender {
                 steamTriggeredSlots.removeAll()
                 releaseHeldDiscreteInputs()
                 sendNeutralGamepads()
+                haptics.values.forEach { $0.stop() }
             } else {
                 lastSnapshots.removeAll()
             }
+        }
+    }
+
+    func applyRumble(controllerId: Int, weak: UInt16, strong: UInt16) {
+        inputQueue.async { [weak self] in
+            guard let self, rumbleEnabled, !self.isPaused else { return }
+            print("[Rumble] applyRumble slot=\(controllerId) weak=\(weak) strong=\(strong) hasEngine=\(haptics[controllerId] != nil)")
+            haptics[controllerId]?.setMotors(strong: strong, weak: weak)
         }
     }
 
@@ -662,6 +697,15 @@ final class InputSender {
             self?.inputQueue.async { [weak self, packet] in
                 self?.packetPool.append(packet)
             }
+        }
+    }
+
+    private func advertiseHaptics(_ enabled: Bool) {
+        guard hapticsAdvertised != enabled else { return }
+        hapticsAdvertised = enabled
+        print("[Rumble] advertised haptics=\(enabled)")
+        sendEncoded(category: .hapticsEnabled) { [encoder] packet in
+            encoder.encodeHapticsEnabled(enabled, into: packet)
         }
     }
 
@@ -1621,6 +1665,11 @@ final class InputSender {
             extendedControllers.append(controller)
             controllerSlots[ObjectIdentifier(controller)] = slot
             controller.playerIndex = playerIndex(for: slot)
+            if rumbleEnabled, let haptic = ControllerHaptics(controller: controller, queue: inputQueue) {
+                haptic.intensityScale = rumbleIntensity
+                haptics[slot] = haptic
+                advertiseHaptics(true)
+            }
             gamepadBitmap |= Self.extendedGamepadBitmapMask(for: slot)
             lastButtons[slot] = mapGCControllerToXInput(controller, deadzone: deadzone).buttons
             pad.valueChangedHandler = { [weak self, weak controller] _, _ in
@@ -1658,6 +1707,9 @@ final class InputSender {
         controller.playerIndex = .indexUnset
         let id = ObjectIdentifier(controller)
         if let slot = controllerSlots.removeValue(forKey: id) {
+            haptics[slot]?.cleanup()
+            haptics[slot] = nil
+            if haptics.isEmpty { advertiseHaptics(false) }
             extendedControllers.removeAll { $0 === controller }
             gamepadBitmap &= ~Self.extendedGamepadBitmapMask(for: slot)
             lastButtons[slot] = nil

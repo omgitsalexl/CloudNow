@@ -56,9 +56,16 @@ private struct CloudMatchResponse: Decodable {
             seatSetupStep ?? seatSetupInfo?.seatSetupStep
         }
 
+        /// Estimated time remaining for queue/setup, in milliseconds (0 when unknown).
+        var resolvedSeatSetupEtaMs: Int? {
+            guard let eta = seatSetupInfo?.seatSetupEta, eta > 0 else { return nil }
+            return eta
+        }
+
         struct SeatSetupInfo: Decodable {
             let queuePosition: Int?
             let seatSetupStep: Int?
+            let seatSetupEta: Int?
         }
 
         struct SessionProgress: Decodable {
@@ -170,7 +177,10 @@ private func resolutionPixels(for settings: StreamSettings) -> (width: Int, heig
 private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: String) -> [String: Any] {
     let (width, height) = resolutionPixels(for: input.settings)
     let tzOffset = TimeZone.current.secondsFromGMT() * 1000
-    let color = input.settings.colorRequest(localCapabilities: .detect(codec: input.settings.codec))
+    let color = input.settings.colorRequest(
+        localCapabilities: .detect(codec: input.settings.codec),
+        accountAllowsHDR: input.accountAllowsHDR
+    )
 
     return [
         "sessionRequestData": [
@@ -214,11 +224,11 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
             "remoteControllersBitmap": 0,
             "clientTimezoneOffset": tzOffset,
             "enhancedStreamMode": 1,
-            "appLaunchMode": 1,
+            "appLaunchMode": input.settings.appLaunchMode.cloudMatchValue,
             "secureRTSPSupported": false,
             "partnerCustomData": "",
             "accountLinked": input.accountLinked,
-            "enablePersistingInGameSettings": true,
+            "enablePersistingInGameSettings": input.settings.persistInGameSettings,
             "userAge": 26,
             "requestedStreamingFeatures": [
                 "reflex": input.settings.fps >= 120,
@@ -237,9 +247,12 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
     ]
 }
 
-private func buildResumeSessionRequestData(appId: String?, settings: StreamSettings, deviceId: String) -> [String: Any] {
+private func buildResumeSessionRequestData(appId: String?, settings: StreamSettings, deviceId: String, accountAllowsHDR: Bool?) -> [String: Any] {
     let (width, height) = resolutionPixels(for: settings)
-    let color = settings.colorRequest(localCapabilities: .detect(codec: settings.codec))
+    let color = settings.colorRequest(
+        localCapabilities: .detect(codec: settings.codec),
+        accountAllowsHDR: accountAllowsHDR
+    )
     var requestData: [String: Any] = [
         "availableSupportedControllers": [],
         "networkTestSessionId": NSNull(),
@@ -274,6 +287,8 @@ private func buildResumeSessionRequestData(appId: String?, settings: StreamSetti
         ],
         "sdrHdrMode": cloudMatchSdrHdrMode(color),
         "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
+        "appLaunchMode": settings.appLaunchMode.cloudMatchValue,
+        "enablePersistingInGameSettings": settings.persistInGameSettings,
         "requestedStreamingFeatures": [
             "reflex": settings.fps >= 120,
             "bitDepth": cloudMatchBitDepth(color),
@@ -618,7 +633,8 @@ actor CloudMatchClient {
         clientId existingClientId: String? = nil,
         deviceId existingDeviceId: String? = nil,
         appId: String? = nil,
-        settings: StreamSettings
+        settings: StreamSettings,
+        accountAllowsHDR: Bool? = nil
     ) async throws -> SessionInfo {
         let clientId = existingClientId ?? UUID().uuidString
         let deviceId = existingDeviceId ?? GFNDeviceIdentity.stableDeviceId()
@@ -651,7 +667,7 @@ actor CloudMatchClient {
         let body: [String: Any] = [
             "action": 2,
             "data": "RESUME",
-            "sessionRequestData": buildResumeSessionRequestData(appId: appId, settings: settings, deviceId: deviceId),
+            "sessionRequestData": buildResumeSessionRequestData(appId: appId, settings: settings, deviceId: deviceId, accountAllowsHDR: accountAllowsHDR),
         ]
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
@@ -745,6 +761,7 @@ actor CloudMatchClient {
             gpuType: s.gpuType,
             queuePosition: s.resolvedQueuePosition,
             seatSetupStep: s.resolvedSeatSetupStep,
+            seatSetupEtaMs: s.resolvedSeatSetupEtaMs,
             iceServers: iceServers,
             mediaConnectionInfo: media,
             clientId: clientId,

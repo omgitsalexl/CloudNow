@@ -244,6 +244,13 @@ enum L10n {
         }
     }
 
+    static func appLaunchModeLabel(_ mode: AppLaunchMode) -> String {
+        switch mode {
+        case .default: text("default")
+        case .bigPicture: text("launch_mode_big_picture")
+        }
+    }
+
     static func overlayTriggerButtonLabel(_ button: OverlayTriggerButton) -> String {
         switch button {
         case .start: text("start_(≡)")
@@ -280,6 +287,16 @@ enum L10n {
         case .mouse: text("remote_mouse")
         case .gamepad: text("remote_gamepad")
         case .dualsense: text("remote_touchpad")
+        }
+    }
+
+    static func setupStageLabel(_ stage: SetupStage) -> String {
+        switch stage {
+        case .connecting: text("connecting_to_server")
+        case .inQueue: text("in_queue")
+        case .configuring: text("preparing_game")
+        case .waitingForStorage: text("waiting_for_storage")
+        case .previousSessionCleanup: text("previous_session_cleanup")
         }
     }
 

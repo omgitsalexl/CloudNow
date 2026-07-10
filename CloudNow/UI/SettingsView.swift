@@ -105,6 +105,21 @@ struct SettingsView: View {
                         Text("Vietnamese").tag("vi_VN")
                         Text("Ukrainian").tag("uk_UA")
                     }
+
+                    Picker(selection: $vm.streamSettings.appLaunchMode) {
+                        ForEach(AppLaunchMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    } label: {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.text("game_launch_mode"))
+                            Text(L10n.text("game_launch_mode_description"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 8)
+                    }
+
                     LabeledContent(L10n.text("max_bitrate")) {
                         HStack(spacing: 16) {
                             Button {
@@ -177,6 +192,45 @@ struct SettingsView: View {
                 }
 
                 Section(L10n.text("controller")) {
+                    Toggle(isOn: $vm.streamSettings.rumbleEnabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.text("controller_rumble"))
+                            Text(L10n.text("controller_rumble_description"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    if vm.streamSettings.rumbleEnabled {
+                        LabeledContent {
+                            HStack(spacing: 16) {
+                                Button {
+                                    vm.streamSettings.rumbleIntensity = max(StreamSettings.minRumbleIntensity, vm.streamSettings.rumbleIntensity - 0.05)
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                }
+                                .buttonStyle(.plain)
+                                Text("\(Int((vm.streamSettings.rumbleIntensity * 100).rounded()))%")
+                                    .monospacedDigit()
+                                    .frame(minWidth: 44)
+                                    .padding(.horizontal, 24)
+                                Button {
+                                    vm.streamSettings.rumbleIntensity = min(StreamSettings.maxRumbleIntensity, vm.streamSettings.rumbleIntensity + 0.05)
+                                } label: {
+                                    Image(systemName: "plus.circle")
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(L10n.text("controller_rumble_intensity"))
+                                Text(L10n.text("controller_rumble_intensity_description"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 8)
+                        }
+                    }
                     LabeledContent {
                         HStack(spacing: 16) {
                             Button {
@@ -296,6 +350,28 @@ struct SettingsView: View {
                         .padding(.vertical, 8)
                     }
                     LabeledContent(L10n.text("protocol"), value: "XInput over GFN v2/v3")
+                }
+
+                Section(L10n.text("game")) {
+                    if viewModel.subscription?.allowsInGameSettingsPersistence == false {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(L10n.text("save_in_game_settings"))
+                            Text(L10n.text("save_in_game_settings_free_unavailable"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 8)
+                    } else {
+                        Toggle(isOn: $vm.streamSettings.persistInGameSettings) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(L10n.text("save_in_game_settings"))
+                                Text(L10n.text("save_in_game_settings_description"))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 8)
+                        }
+                    }
                 }
 
                 Section(L10n.text("diagnostics")) {

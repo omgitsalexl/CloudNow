@@ -7,7 +7,6 @@ struct LoginView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
             switch authManager.loginPhase {
             case .idle:
                 loginPrompt

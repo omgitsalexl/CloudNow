@@ -10,8 +10,6 @@ struct HomeView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
-
             if viewModel.isLoading {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 0) {
@@ -218,7 +216,7 @@ struct HomeView: View {
                 .foregroundStyle(.secondary)
             Text(L10n.text("nothing_here_yet"))
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(.primary)
             Text(L10n.text("empty_home_message"))
                 .font(.body)
                 .foregroundStyle(.secondary)

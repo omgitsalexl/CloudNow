@@ -1,4 +1,5 @@
 import Charts
+import Combine
 import os.log
 import SwiftUI
 
@@ -23,6 +24,7 @@ struct StreamView: View {
 
     @Environment(AuthManager.self) var authManager
     @Environment(GamesViewModel.self) var viewModel
+    @Environment(\.colorScheme) private var colorScheme
     @State private var streamController = GFNStreamController()
     @State private var overlayState: StreamOverlayState = .none
     @State private var showExitConfirmation = false
@@ -34,11 +36,23 @@ struct StreamView: View {
     /// Per-ad state tracking to avoid duplicate reports
     @State private var adReportedAction: [String: AdAction] = [:]
 
+    /// Loading progress bar state (ETA-driven, mirrors the official client's determinate bar).
+    @State private var loadingProgress: Double = 0
+    /// Largest queue position seen this attempt, used as the 0% anchor so the bar fills as it drops.
+    @State private var queueAnchor: Int?
+    @State private var prepareStartedAt: Date?
+    /// Latest server-reported remaining setup ETA, and when it was captured (for live countdown).
+    @State private var prepareEta: TimeInterval?
+    @State private var prepareEtaAt: Date?
+    /// Feature badges to show on the loading screen (game supports it AND the client can use it).
+    @State private var loadingBadges: [GameFeature] = []
+
     private let cloudMatchClient = CloudMatchClient()
+    private let progressTick = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            hostBackground.ignoresSafeArea()
 
             switch streamController.state {
             case .idle, .connecting:
@@ -57,6 +71,7 @@ struct StreamView: View {
         }
         .ignoresSafeArea()
         .task {
+            computeLoadingBadges()
             streamController.onReconnectNeeded = { [self] in
                 await reclaimSession()
             }
@@ -86,51 +101,162 @@ struct StreamView: View {
     // MARK: Connecting
 
     private var connectingView: some View {
-        VStack(spacing: 24) {
-            if case .timedOut = loadingPhase {
-                Image(systemName: "clock.badge.xmark")
-                    .font(.system(size: 60))
-                    .foregroundStyle(.orange)
-            } else {
-                ProgressView()
-                    .scaleEffect(2)
-                    .tint(.white)
-            }
-            Text(L10n.format("starting_game", game.title))
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
-            Text(loadingLabel)
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .animation(.easeInOut, value: loadingPhase)
-
-            // Show ad player when GFN requires watching an ad to stay in queue
-            if let adState = createdSession?.adState,
-               adState.isAdsRequired,
-               let ad = adState.ads.first
-            {
-                QueueAdPlayerView(
-                    ad: ad,
-                    onStart: { id in reportAd(id: id, action: .start) },
-                    onPause: { id in reportAd(id: id, action: .pause) },
-                    onResume: { id in reportAd(id: id, action: .resume) },
-                    onFinish: { id, ms in reportAd(id: id, action: .finish, watchedMs: ms) },
-                    message: adState.message
-                )
-                .frame(maxWidth: 560)
-            }
-
-            HStack(spacing: 24) {
+        // Top-left, left-aligned column (game title → status → progress bar → cancel), mirroring
+        // the official client, whose primary content sits top-left with only a "powered by" strip
+        // pushed to the bottom (loading-ui-badges { margin-top: auto }).
+        ZStack(alignment: .topLeading) {
+            loadingBackground
+            VStack(alignment: .leading, spacing: 16) {
                 if case .timedOut = loadingPhase {
-                    Button(L10n.text("retry")) { Task { await startSession() } }
-                        .buttonStyle(.bordered)
-                        .tint(.blue)
+                    Image(systemName: "clock.badge.xmark")
+                        .font(.system(size: 48))
+                        .foregroundStyle(.orange)
                 }
-                Button(L10n.text("cancel")) { disconnect() }
-                    .buttonStyle(.bordered)
-                    .tint(loadingPhase == .timedOut ? .red : .secondary)
+                Text(game.title)
+                    .font(.largeTitle.weight(.bold))
+                    .foregroundStyle(loadingForegroundColor)
+                    .lineLimit(2)
+                Text(loadingLabel)
+                    .font(.title3)
+                    .foregroundStyle(loadingSecondaryForegroundColor)
+                    .lineLimit(1)
+                    .animation(.easeInOut, value: loadingPhase)
+
+                if case .timedOut = loadingPhase {
+                    EmptyView()
+                } else if showDeterminateProgress {
+                    ProgressView(value: loadingProgress)
+                        .progressViewStyle(.linear)
+                        .tint(loadingForegroundColor)
+                        .frame(maxWidth: 560)
+                        .padding(.top, 8)
+                } else {
+                    ProgressView()
+                        .tint(loadingForegroundColor)
+                        .padding(.top, 8)
+                }
+
+                // Show ad player when GFN requires watching an ad to stay in queue
+                if let adState = createdSession?.adState,
+                   adState.isAdsRequired,
+                   let ad = adState.ads.first
+                {
+                    QueueAdPlayerView(
+                        ad: ad,
+                        onStart: { id in reportAd(id: id, action: .start) },
+                        onPause: { id in reportAd(id: id, action: .pause) },
+                        onResume: { id in reportAd(id: id, action: .resume) },
+                        onFinish: { id, ms in reportAd(id: id, action: .finish, watchedMs: ms) },
+                        message: adState.message
+                    )
+                    .frame(maxWidth: 560)
+                    .padding(.top, 8)
+                }
+
+                HStack(spacing: 24) {
+                    if case .timedOut = loadingPhase {
+                        Button(L10n.text("retry")) { Task { await startSession() } }
+                            .buttonStyle(.bordered)
+                            .tint(.blue)
+                    }
+                    Button(L10n.text("cancel")) { disconnect() }
+                        .buttonStyle(.bordered)
+                        .tint(loadingPhase == .timedOut ? .red : .secondary)
+                }
+                .padding(.top, 8)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 90)
+            .padding(.top, 80)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .overlay(alignment: .bottomLeading) { loadingBadgeRow }
+        .onReceive(progressTick) { _ in advanceLoadingProgress() }
+    }
+
+    /// Feature badges (RTX/HDR/Reflex) shown bottom-left, mirroring the official client's badge
+    /// strip. Only badges the game supports AND the client can actually use are present — see
+    /// computeLoadingBadges().
+    @ViewBuilder private var loadingBadgeRow: some View {
+        if !loadingBadges.isEmpty, loadingPhase != .timedOut {
+            HStack(spacing: 12) {
+                ForEach(loadingBadges, id: \.self) { badge in
+                    Label(badge.label, systemImage: badge.symbol)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(loadingForegroundColor)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(loadingForegroundColor.opacity(0.15), in: Capsule())
+                        .overlay(Capsule().strokeBorder(loadingForegroundColor.opacity(0.25), lineWidth: 1))
+                }
+            }
+            .padding(.horizontal, 90)
+            .padding(.bottom, 60)
+        }
+    }
+
+    /// A badge shows only when the game supports the feature AND it's actually usable here:
+    /// HDR requires the client's 10-bit/HDR pipeline, display, and an HDR-entitled tier; RTX
+    /// requires a premium tier; Reflex is shown whenever the game supports it. Mirrors the
+    /// official client's supportedOnGame + systemSupported + subscription gating.
+    private func computeLoadingBadges() {
+        let supported = Set(game.supportedFeatures ?? [])
+        guard !supported.isEmpty else { loadingBadges = []; return }
+        let tier = (viewModel.subscription?.membershipTier ?? "").uppercased()
+        let tierPremium = tier.contains("ULTIMATE") || tier.contains("PERFORMANCE") || tier.contains("PRIORITY")
+        let caps = LocalVideoCapabilities.detect(codec: .h265)
+        let hdrUsable = caps.supportsHardware10BitDecode && caps.displaySupportsHDR && tierPremium
+        var badges: [GameFeature] = []
+        if supported.contains(.rtx), tierPremium { badges.append(.rtx) }
+        if supported.contains(.hdr), hdrUsable { badges.append(.hdr) }
+        if supported.contains(.reflex) { badges.append(.reflex) }
+        loadingBadges = badges
+    }
+
+    /// True when the loading screen has full-bleed key art behind it. With art, foreground content
+    /// stays white over the art's dark scrim; without art we fall through to the host's theme-aware
+    /// background (added in #52) and adopt its foreground color so text stays legible in light mode.
+    private var hasLoadingArt: Bool {
+        (game.heroImageUrl ?? game.heroBannerUrl).flatMap { URL(string: $0) } != nil
+    }
+
+    /// Primary loading foreground: white over key art, the host theme color over the themed fallback.
+    private var loadingForegroundColor: Color {
+        hasLoadingArt ? .white : hostPrimaryForegroundColor
+    }
+
+    /// Dimmed loading foreground (status line), tracking the primary's contrast.
+    private var loadingSecondaryForegroundColor: Color {
+        hasLoadingArt ? .white.opacity(0.85) : hostPrimaryForegroundColor.opacity(0.7)
+    }
+
+    @ViewBuilder private var loadingBackground: some View {
+        // Prefer HERO_IMAGE (full-bleed key art) for the full-screen loading background, matching
+        // the official client; fall back to the TV_BANNER-based heroBannerUrl when it's absent.
+        if let url = (game.heroImageUrl ?? game.heroBannerUrl).flatMap({ URL(string: $0) }) {
+            AsyncImage(url: url) { image in
+                image
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } placeholder: {
+                Color.black
+            }
+            .ignoresSafeArea()
+            .overlay(
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(0.85), location: 0),
+                        .init(color: .black.opacity(0.5), location: 0.4),
+                        .init(color: .black.opacity(0.2), location: 1),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .ignoresSafeArea()
+            )
+        }
+        // No key art: render nothing so the host's theme-aware background (body's hostBackground,
+        // from #52) shows through as the fallback — matching the app background in light and dark.
     }
 
     private var loadingLabel: String {
@@ -141,9 +267,65 @@ struct StreamView: View {
             if let pos { return L10n.format("in_queue_position", pos) }
             return L10n.text("in_queue")
         case .preparing:
-            return L10n.text("preparing_game")
+            return (createdSession?.setupStage ?? .configuring).label
         case .timedOut:
             return L10n.text("server_took_too_long")
+        }
+    }
+
+    /// Determinate bar once the server gives us a queue position or setup stage; the earliest
+    /// "finding" moment (and the timed-out state) has no forward signal, so it stays a spinner —
+    /// matching the official client, which is indeterminate until an ETA arrives.
+    private var showDeterminateProgress: Bool {
+        switch loadingPhase {
+        case .finding, .timedOut: false
+        case .inQueue, .preparing: true
+        }
+    }
+
+    /// Eases the bar toward a phase-derived target. Queue fills as the position drops toward its
+    /// first-seen anchor; setup fills over the server ETA (falling back to a nominal duration).
+    /// The value only ever moves forward, so it never visibly jumps backward on a poll update.
+    private func advanceLoadingProgress() {
+        let target: Double
+        switch loadingPhase {
+        case .finding:
+            prepareStartedAt = nil
+            target = 0.06
+        case let .inQueue(pos):
+            prepareStartedAt = nil
+            if let pos {
+                queueAnchor = max(queueAnchor ?? pos, pos)
+                let anchor = max(queueAnchor ?? pos, 1)
+                let advanced = Double(anchor - pos) / Double(anchor)
+                target = 0.08 + 0.47 * min(max(advanced, 0), 1)
+            } else {
+                target = 0.25
+            }
+        case .preparing:
+            let now = Date()
+            if prepareStartedAt == nil { prepareStartedAt = now }
+            // seatSetupEta is the server's estimated *remaining* time. Refresh it whenever the
+            // server revises the estimate (e.g. 30s → 20s) and count it down between polls so the
+            // bar keeps advancing; mapping progress by elapsed / (elapsed + remaining) makes it
+            // complete as the estimate approaches zero, matching the official client.
+            if let serverEta = createdSession?.seatSetupEta, serverEta != prepareEta {
+                prepareEta = serverEta
+                prepareEtaAt = now
+            }
+            let elapsed = prepareStartedAt.map { now.timeIntervalSince($0) } ?? 0
+            let liveRemaining: Double = if let eta = prepareEta, let at = prepareEtaAt {
+                max(eta - now.timeIntervalSince(at), 0)
+            } else {
+                max(30 - elapsed, 0)
+            }
+            let total = max(elapsed + liveRemaining, 4)
+            target = 0.55 + 0.41 * min(elapsed / total, 1)
+        case .timedOut:
+            return
+        }
+        if target > loadingProgress {
+            loadingProgress = min(target, loadingProgress + (target - loadingProgress) * 0.12 + 0.0006)
         }
     }
 
@@ -540,7 +722,7 @@ struct StreamView: View {
                 .scaleEffect(1.5)
             Text(L10n.text("reconnecting"))
                 .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(L10n.format("attempt_of", attempt))
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -558,7 +740,7 @@ struct StreamView: View {
                 .foregroundStyle(.green)
             Text(L10n.text("session_ended"))
                 .font(.title.weight(.bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(L10n.text("your_game_session_has_ended"))
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -604,7 +786,7 @@ struct StreamView: View {
                 .foregroundStyle(color)
             Text(title)
                 .font(.title.weight(.bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(hostPrimaryForegroundColor)
             Text(message)
                 .font(.body)
                 .foregroundStyle(.secondary)
@@ -619,6 +801,37 @@ struct StreamView: View {
             }
         }
         .padding(60)
+    }
+
+    @ViewBuilder
+    private var hostBackground: some View {
+        if colorScheme == .dark {
+            Color(white: 29.0 / 255.0)
+        } else {
+            LinearGradient(
+                colors: [
+                    Color(white: 0.74),
+                    Color(white: 0.68),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .overlay {
+                RadialGradient(
+                    colors: [
+                        Color.white.opacity(0.16),
+                        .clear,
+                    ],
+                    center: .top,
+                    startRadius: 0,
+                    endRadius: 1100
+                )
+            }
+        }
+    }
+
+    private var hostPrimaryForegroundColor: Color {
+        colorScheme == .dark ? .white : .black
     }
 
     // MARK: Actions
@@ -651,7 +864,8 @@ struct StreamView: View {
                     clientId: direct.clientId,
                     deviceId: direct.deviceId,
                     appId: game.variants.first?.appId ?? game.variants.first?.id,
-                    settings: settings
+                    settings: settings,
+                    accountAllowsHDR: viewModel.subscription?.allowsHDR
                 )
                 streamLog.info("startSession: claimed session, status=\(sessionInfo.status)")
                 createdSession = sessionInfo
@@ -679,7 +893,7 @@ struct StreamView: View {
 
                 streamLog.info("startSession: direct path ready, connecting WebRTC")
                 viewModel.recordPlayed(game)
-                await streamController.connect(session: sessionInfo, settings: settings)
+                await streamController.connect(session: sessionInfo, settings: settings, accountAllowsHDR: viewModel.subscription?.allowsHDR)
             } catch {
                 streamLog.error("startSession: direct path failed: \(error)")
                 streamController.fail(with: error.localizedDescription)
@@ -702,6 +916,11 @@ struct StreamView: View {
         }
         createdSession = nil
         loadingPhase = .finding
+        loadingProgress = 0
+        queueAnchor = nil
+        prepareStartedAt = nil
+        prepareEta = nil
+        prepareEtaAt = nil
         do {
             let token = try await authManager.resolveToken()
             streamLog.info("startSession: token resolved")
@@ -731,7 +950,8 @@ struct StreamView: View {
                         ? viewModel.lastSession?.deviceId
                         : nil,
                     appId: existing.appId,
-                    settings: settings
+                    settings: settings,
+                    accountAllowsHDR: viewModel.subscription?.allowsHDR
                 )
                 streamLog.info("startSession: claimed, status=\(sessionInfo.status)")
             } else {
@@ -754,7 +974,8 @@ struct StreamView: View {
                             clientId: last.clientId,
                             deviceId: last.deviceId,
                             appId: last.appId,
-                            settings: settings
+                            settings: settings,
+                            accountAllowsHDR: viewModel.subscription?.allowsHDR
                         )
                         print("[Resume] claimed session, status=\(sessionInfo.status)")
                         createdSession = sessionInfo
@@ -811,6 +1032,7 @@ struct StreamView: View {
             var setupStartTime: Date? = nil
 
             while readyPollStreak < 2 {
+                streamLog.info("poll: status=\(sessionInfo.status) seatSetupStep=\(sessionInfo.seatSetupStep ?? -1) queuePosition=\(sessionInfo.queuePosition ?? -1) seatSetupEtaMs=\(sessionInfo.seatSetupEtaMs ?? -1)")
                 // Update loading phase and apply timeout only outside the queue
                 if sessionInfo.isInQueue {
                     loadingPhase = .inQueue(sessionInfo.queuePosition)
@@ -848,7 +1070,7 @@ struct StreamView: View {
             streamLog.info("startSession: queue cleared, readyPollStreak=\(readyPollStreak), connecting WebRTC")
             streamLog.info("startSession: serverIp=\(sessionInfo.serverIp), signalingUrl=\(sessionInfo.signalingUrl)")
             viewModel.recordPlayed(game)
-            await streamController.connect(session: sessionInfo, settings: settings)
+            await streamController.connect(session: sessionInfo, settings: settings, accountAllowsHDR: viewModel.subscription?.allowsHDR)
         } catch {
             streamLog.error("startSession: FAILED: \(error)")
             streamController.fail(with: error.localizedDescription)
@@ -868,7 +1090,8 @@ struct StreamView: View {
                 clientId: session.clientId,
                 deviceId: session.deviceId,
                 appId: game.variants.first?.appId ?? game.variants.first?.id,
-                settings: settings
+                settings: settings,
+                accountAllowsHDR: viewModel.subscription?.allowsHDR
             )
             createdSession = reclaimed
             streamLog.info("reclaimSession: success, status=\(reclaimed.status)")
@@ -929,7 +1152,8 @@ struct StreamView: View {
             streamingBaseUrl: routeSelection.base,
             routingZoneUrl: routeSelection.routingZoneUrl,
             settings: settings,
-            accountLinked: true
+            accountLinked: true,
+            accountAllowsHDR: viewModel.subscription?.allowsHDR
         )
 
         do {
