@@ -80,7 +80,7 @@ enum InputSendDisposition {
     case superseded
 }
 
-enum SubmittedTextValidationResult {
+enum SubmittedTextValidationResult: Sendable {
     case supported
     case unsupportedCharacters
 }
@@ -477,7 +477,7 @@ final class InputSender {
         let button: GCControllerButtonInput
     }
 
-    private struct KeyboardReplayEvent {
+    private struct KeyboardReplayEvent: Sendable {
         let down: Bool
         let vk: UInt16
         let scancode: UInt16
@@ -1383,12 +1383,18 @@ final class InputSender {
         }
     }
 
+    @discardableResult
     func replaySubmittedText(
         _ text: String,
         appendEnter: Bool = true,
         completion: @escaping @Sendable () -> Void
-    ) {
-        inputQueue.async { [weak self] in
+    ) -> SubmittedTextValidationResult {
+        // Reject unsupported text before altering any active remote input state.
+        guard let events = keyboardReplayPlan(for: text, appendEnter: appendEnter) else {
+            return .unsupportedCharacters
+        }
+
+        inputQueue.async { [weak self, events] in
             guard let self else {
                 DispatchQueue.main.async(execute: completion)
                 return
@@ -1396,18 +1402,10 @@ final class InputSender {
 
             releaseHeldDiscreteInputs()
             sendNeutralGamepads()
-
-            guard let events = keyboardReplayPlan(for: text, appendEnter: appendEnter) else {
-                DispatchQueue.main.async(execute: completion)
-                return
-            }
-
             replayKeyboardEvents(events, index: 0, completion: completion)
         }
-    }
 
-    func validateSubmittedText(_ text: String, appendEnter: Bool = true) -> SubmittedTextValidationResult {
-        keyboardReplayPlan(for: text, appendEnter: appendEnter) == nil ? .unsupportedCharacters : .supported
+        return .supported
     }
 
     private func replayKeyboardEvents(
