@@ -22,11 +22,15 @@ enum SDPMunger {
             let pt = String(parts[0])
             let name = parts[1].components(separatedBy: "/").first?.lowercased() ?? ""
             let isMatch = name == targetName || (codec == .h265 && name == "hevc")
-            if isMatch { allowedPTs.insert(pt) }
+            if isMatch {
+                allowedPTs.insert(pt)
+            }
         }
 
         guard !allowedPTs.isEmpty else {
-            if codec != .h264 { return preferCodec(sdp, codec: .h264) }
+            if codec != .h264 {
+                return preferCodec(sdp, codec: .h264)
+            }
             return sdp
         }
 
@@ -40,7 +44,9 @@ enum SDPMunger {
             if let aptRange = params.range(of: "apt=") {
                 let apt = String(params[aptRange.upperBound...])
                     .components(separatedBy: CharacterSet(charactersIn: "; ")).first ?? ""
-                if allowedPTs.contains(apt) { allowedPTs.insert(rtxPt) }
+                if allowedPTs.contains(apt) {
+                    allowedPTs.insert(rtxPt)
+                }
             }
         }
 
@@ -54,7 +60,11 @@ enum SDPMunger {
                 let isPreferred = lines.contains(where: {
                     $0.hasPrefix("a=fmtp:\(pt) ") && $0.contains(preferredProfileId)
                 })
-                if isPreferred { h265PreferredPTs.append(pt) } else { h265OtherPTs.append(pt) }
+                if isPreferred {
+                    h265PreferredPTs.append(pt)
+                } else {
+                    h265OtherPTs.append(pt)
+                }
             }
         }
 
@@ -83,7 +93,9 @@ enum SDPMunger {
                 }
                 continue
             }
-            if line.hasPrefix("m=") { inVideo = false }
+            if line.hasPrefix("m=") {
+                inVideo = false
+            }
 
             // Drop attribute lines for non-allowed PTs in the video section
             if inVideo, let pt = videoLinePT(line), !allowedPTs.contains(pt) {
@@ -132,14 +144,20 @@ enum SDPMunger {
         var inVideo = false
 
         for line in lines {
-            if line.hasPrefix("m=video") { inVideo = true; continue }
-            if line.hasPrefix("m=") { inVideo = false }
+            if line.hasPrefix("m=video") {
+                inVideo = true; continue
+            }
+            if line.hasPrefix("m=") {
+                inVideo = false
+            }
             guard inVideo, line.hasPrefix("a=rtpmap:") else { continue }
             let rest = String(line.dropFirst("a=rtpmap:".count))
             let parts = rest.components(separatedBy: " ")
             guard parts.count >= 2 else { continue }
             let name = parts[1].components(separatedBy: "/").first?.uppercased() ?? ""
-            if name == "H265" || name == "HEVC" { h265PTs.insert(String(parts[0])) }
+            if name == "H265" || name == "HEVC" {
+                h265PTs.insert(String(parts[0]))
+            }
         }
 
         guard !h265PTs.isEmpty else { return sdp }
@@ -164,14 +182,20 @@ enum SDPMunger {
         var inVideo = false
 
         for line in lines {
-            if line.hasPrefix("m=video") { inVideo = true; continue }
-            if line.hasPrefix("m=") { inVideo = false }
+            if line.hasPrefix("m=video") {
+                inVideo = true; continue
+            }
+            if line.hasPrefix("m=") {
+                inVideo = false
+            }
             guard inVideo, line.hasPrefix("a=rtpmap:") else { continue }
             let rest = String(line.dropFirst("a=rtpmap:".count))
             let parts = rest.components(separatedBy: " ")
             guard parts.count >= 2 else { continue }
             let name = parts[1].components(separatedBy: "/").first?.uppercased() ?? ""
-            if name == "H265" || name == "HEVC" { h265PTs.insert(String(parts[0])) }
+            if name == "H265" || name == "HEVC" {
+                h265PTs.insert(String(parts[0]))
+            }
         }
 
         guard !h265PTs.isEmpty else { return sdp }

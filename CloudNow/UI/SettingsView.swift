@@ -623,20 +623,48 @@ private struct TextInputTriggerSequenceCaptureView: View {
         }
 
         var pressedButtons = Set<ControllerSequenceButton>()
-        if pad.dpad.up.isPressed { pressedButtons.insert(.dpadUp) }
-        if pad.dpad.down.isPressed { pressedButtons.insert(.dpadDown) }
-        if pad.dpad.left.isPressed { pressedButtons.insert(.dpadLeft) }
-        if pad.dpad.right.isPressed { pressedButtons.insert(.dpadRight) }
-        if pad.buttonA.isPressed { pressedButtons.insert(.buttonA) }
-        if pad.buttonB.isPressed { pressedButtons.insert(.buttonB) }
-        if pad.buttonX.isPressed { pressedButtons.insert(.buttonX) }
-        if pad.buttonY.isPressed { pressedButtons.insert(.buttonY) }
-        if pad.buttonMenu.isPressed { pressedButtons.insert(.menu) }
-        if pad.buttonOptions?.isPressed == true { pressedButtons.insert(.options) }
-        if pad.leftShoulder.isPressed { pressedButtons.insert(.leftShoulder) }
-        if pad.rightShoulder.isPressed { pressedButtons.insert(.rightShoulder) }
-        if pad.leftThumbstickButton?.isPressed == true { pressedButtons.insert(.leftThumbstick) }
-        if pad.rightThumbstickButton?.isPressed == true { pressedButtons.insert(.rightThumbstick) }
+        if pad.dpad.up.isPressed {
+            pressedButtons.insert(.dpadUp)
+        }
+        if pad.dpad.down.isPressed {
+            pressedButtons.insert(.dpadDown)
+        }
+        if pad.dpad.left.isPressed {
+            pressedButtons.insert(.dpadLeft)
+        }
+        if pad.dpad.right.isPressed {
+            pressedButtons.insert(.dpadRight)
+        }
+        if pad.buttonA.isPressed {
+            pressedButtons.insert(.buttonA)
+        }
+        if pad.buttonB.isPressed {
+            pressedButtons.insert(.buttonB)
+        }
+        if pad.buttonX.isPressed {
+            pressedButtons.insert(.buttonX)
+        }
+        if pad.buttonY.isPressed {
+            pressedButtons.insert(.buttonY)
+        }
+        if pad.buttonMenu.isPressed {
+            pressedButtons.insert(.menu)
+        }
+        if pad.buttonOptions?.isPressed == true {
+            pressedButtons.insert(.options)
+        }
+        if pad.leftShoulder.isPressed {
+            pressedButtons.insert(.leftShoulder)
+        }
+        if pad.rightShoulder.isPressed {
+            pressedButtons.insert(.rightShoulder)
+        }
+        if pad.leftThumbstickButton?.isPressed == true {
+            pressedButtons.insert(.leftThumbstick)
+        }
+        if pad.rightThumbstickButton?.isPressed == true {
+            pressedButtons.insert(.rightThumbstick)
+        }
         return pressedButtons
     }
 }
@@ -773,7 +801,9 @@ private struct ZonePickerView: View {
             isLoading = false
             let batchSize = 6
             for start in stride(from: 0, to: zones.count, by: batchSize) {
-                if Task.isCancelled { return }
+                if Task.isCancelled {
+                    return
+                }
                 let end = min(start + batchSize, zones.count)
                 let batch = zones[start ..< end]
                 await withTaskGroup(of: (String, Int?).self) { group in
@@ -784,7 +814,9 @@ private struct ZonePickerView: View {
                         }
                     }
                     for await (id, ping) in group {
-                        if Task.isCancelled { return }
+                        if Task.isCancelled {
+                            return
+                        }
                         if let idx = zones.firstIndex(where: { $0.id == id }) {
                             zones[idx].pingMs = ping
                             zones[idx].isMeasuring = false
@@ -800,16 +832,28 @@ private struct ZonePickerView: View {
     }
 
     private func queueColor(_ q: Int) -> Color {
-        if q <= 5 { return .green }
-        if q <= 15 { return .yellow }
-        if q <= 30 { return .orange }
+        if q <= 5 {
+            return .green
+        }
+        if q <= 15 {
+            return .yellow
+        }
+        if q <= 30 {
+            return .orange
+        }
         return .red
     }
 
     private func pingColor(_ ms: Int) -> Color {
-        if ms < 30 { return .green }
-        if ms < 80 { return .yellow }
-        if ms < 150 { return .orange }
+        if ms < 30 {
+            return .green
+        }
+        if ms < 80 {
+            return .yellow
+        }
+        if ms < 150 {
+            return .orange
+        }
         return .red
     }
 }

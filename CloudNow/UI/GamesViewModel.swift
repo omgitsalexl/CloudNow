@@ -237,7 +237,9 @@ class GamesViewModel {
             // Only cache library (small); catalog is too large for tvOS UserDefaults
             saveCache(Self.libraryCacheKey, data: merged)
         } catch {
-            if !hadCache { self.error = error.localizedDescription }
+            if !hadCache {
+                self.error = error.localizedDescription
+            }
         }
         isLibraryLoading = false
         isLoading = false
@@ -297,7 +299,9 @@ class GamesViewModel {
     func recordPlayed(_ game: GameInfo) {
         recentlyPlayedIds.removeAll { $0 == game.id }
         recentlyPlayedIds.insert(game.id, at: 0)
-        if recentlyPlayedIds.count > 10 { recentlyPlayedIds = Array(recentlyPlayedIds.prefix(10)) }
+        if recentlyPlayedIds.count > 10 {
+            recentlyPlayedIds = Array(recentlyPlayedIds.prefix(10))
+        }
         let data = try? JSONEncoder().encode(recentlyPlayedIds)
         UserDefaults.standard.set(data, forKey: "gfn.recentlyPlayed")
     }
@@ -442,7 +446,9 @@ class GamesViewModel {
     }
 
     private func autoZoneScore(_ zone: GFNZone, maxPing: [GFNZone], maxQueue: [GFNZone], isUnlimited: Bool) -> Double {
-        if isUnlimited { return Double(zone.pingMs ?? .max) }
+        if isUnlimited {
+            return Double(zone.pingMs ?? .max)
+        }
         let mp = Double(Swift.max(maxPing.compactMap(\.pingMs).max() ?? 1, 1))
         let mq = Double(Swift.max(maxQueue.map(\.queuePosition).max() ?? 1, 1))
         return (Double(zone.pingMs ?? Int(mp)) / mp) * 0.4 + (Double(zone.queuePosition) / mq) * 0.6

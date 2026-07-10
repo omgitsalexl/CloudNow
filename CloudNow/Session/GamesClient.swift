@@ -167,10 +167,18 @@ actor GamesClient {
         for variant in variants {
             for flag in variant.gfn?.features ?? [] {
                 switch flag.key {
-                case "RTX_ENABLED": if flag.value == "true" { found.insert(.rtx) }
-                case "HDR_ENABLED": if flag.value == "true" { found.insert(.hdr) }
-                case "SUPPORTED_HDR_VERSION": if !(flag.values ?? []).isEmpty { found.insert(.hdr) }
-                case "REFLEX_ENABLED": if flag.value == "true" { found.insert(.reflex) }
+                case "RTX_ENABLED": if flag.value == "true" {
+                        found.insert(.rtx)
+                    }
+                case "HDR_ENABLED": if flag.value == "true" {
+                        found.insert(.hdr)
+                    }
+                case "SUPPORTED_HDR_VERSION": if !(flag.values ?? []).isEmpty {
+                        found.insert(.hdr)
+                    }
+                case "REFLEX_ENABLED": if flag.value == "true" {
+                        found.insert(.reflex)
+                    }
                 default: break
                 }
             }
@@ -228,7 +236,9 @@ actor GamesClient {
             }
             if let nested = dict[key] as? [String: Any] {
                 let entries = nested.values.compactMap { $0 as? [String: Any] }
-                if !entries.isEmpty { return entries }
+                if !entries.isEmpty {
+                    return entries
+                }
             }
         }
         let entries = dict.values.compactMap { $0 as? [String: Any] }
@@ -286,7 +296,9 @@ actor GamesClient {
                     ?? "GFN"
                 return GameVariant(id: id, appStore: store, appId: isNumericId(id) ? id : nil)
             }
-            if !variants.isEmpty { return variants }
+            if !variants.isEmpty {
+                return variants
+            }
         }
 
         let id = stringValue(entry["appId"])
@@ -551,8 +563,12 @@ actor GamesClient {
     }
 
     private func stringValue(_ value: Any?) -> String? {
-        if let string = value as? String, !string.isEmpty { return string }
-        if let number = value as? NSNumber { return number.stringValue }
+        if let string = value as? String, !string.isEmpty {
+            return string
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
         return nil
     }
 

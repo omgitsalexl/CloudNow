@@ -7,7 +7,7 @@ struct StreamSettings: Codable, Equatable {
     static let minControllerDeadzone = 0.0
     static let maxControllerDeadzone = 0.30
     static let minTextInputTriggerDelayMs = 50
-    static let maxTextInputTriggerDelayMs = 1_500
+    static let maxTextInputTriggerDelayMs = 1500
     static let textInputTriggerDelayStepMs = 50
     static let defaultTextInputTriggerDelayMs = 150
     static let minRumbleIntensity = 0.0
@@ -53,6 +53,7 @@ struct StreamSettings: Codable, Equatable {
             )
         }
     }
+
     /// Default remote/controller input mode when a stream session starts.
     var defaultRemoteInputMode: RemoteInputMode = .mouse
     /// Preferred zone URL, e.g. "https://np-aws-us-n-virginia-1.cloudmatchbeta.nvidiagrid.net/"
@@ -505,8 +506,12 @@ struct SessionAdInfo: Codable, Equatable, Identifiable {
 
     /// Returns the best available media URL.
     var preferredMediaURL: URL? {
-        if let url = adMediaFiles.compactMap({ $0.mediaFileUrl.flatMap(URL.init) }).first { return url }
-        if let url = adUrl.flatMap(URL.init) { return url }
+        if let url = adMediaFiles.compactMap({ $0.mediaFileUrl.flatMap(URL.init) }).first {
+            return url
+        }
+        if let url = adUrl.flatMap(URL.init) {
+            return url
+        }
         return mediaUrl.flatMap(URL.init)
     }
 }
@@ -542,7 +547,9 @@ struct SessionInfo {
 
     /// True while the session is sitting in the GFN queue (no timeout applies).
     var isInQueue: Bool {
-        if seatSetupStep == 1 { return true }
+        if seatSetupStep == 1 {
+            return true
+        }
         return (queuePosition ?? 0) > 1
     }
 

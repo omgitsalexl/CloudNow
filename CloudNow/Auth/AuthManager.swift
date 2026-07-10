@@ -100,8 +100,12 @@ final class AuthManager {
                         let savedRefreshToken = tokens.refreshToken // preserve device-flow refreshToken
                         let savedIdToken = tokens.idToken // preserve device-flow idToken
                         tokens = rebound
-                        if tokens.refreshToken == nil { tokens.refreshToken = savedRefreshToken }
-                        if tokens.idToken == nil { tokens.idToken = savedIdToken }
+                        if tokens.refreshToken == nil {
+                            tokens.refreshToken = savedRefreshToken
+                        }
+                        if tokens.idToken == nil {
+                            tokens.idToken = savedIdToken
+                        }
                         // Re-fetch clientToken for the re-bound session
                         if let ct2 = try? await api.fetchClientToken(accessToken: tokens.accessToken) {
                             tokens.clientToken = ct2.token
@@ -231,7 +235,9 @@ final class AuthManager {
                 print("[Auth] client_token grant did not return a refreshToken — preserving previous one")
                 updated.tokens.refreshToken = savedRefreshToken
             }
-            if updated.tokens.idToken == nil { updated.tokens.idToken = savedIdToken }
+            if updated.tokens.idToken == nil {
+                updated.tokens.idToken = savedIdToken
+            }
         } else if let refreshToken = s.tokens.refreshToken {
             print("[Auth] client_token path unavailable or failed, falling back to refresh_token grant")
             let savedRefreshToken = updated.tokens.refreshToken
@@ -241,7 +247,9 @@ final class AuthManager {
                 print("[Auth] refresh_token grant did not return a new refreshToken — preserving previous one")
                 updated.tokens.refreshToken = savedRefreshToken
             }
-            if updated.tokens.idToken == nil { updated.tokens.idToken = savedIdToken }
+            if updated.tokens.idToken == nil {
+                updated.tokens.idToken = savedIdToken
+            }
             print("[Auth] refresh via refresh_token grant succeeded")
         } else if let idToken = s.tokens.idToken {
             // Third path: the idToken is a longer-lived JWT (typically 30 days) that NVIDIA
@@ -270,7 +278,9 @@ final class AuthManager {
                 updated.tokens.refreshToken = savedRefreshToken
             }
             // Preserve the idToken used for bootstrap so we can re-use it on the next cycle
-            if updated.tokens.idToken == nil { updated.tokens.idToken = idToken }
+            if updated.tokens.idToken == nil {
+                updated.tokens.idToken = idToken
+            }
         } else {
             print("[Auth] refresh failed: no usable clientToken, refreshToken, or idToken available")
             throw AuthError.tokenRefreshFailed("All refresh mechanisms exhausted.")
