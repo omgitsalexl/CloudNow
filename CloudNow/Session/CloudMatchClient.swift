@@ -1,4 +1,10 @@
 import Foundation
+import os.log
+
+private let cloudMatchLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "CloudMatch")
+/// Same subsystem/category as cloudMatchLog, used only for `isEnabled(type:)` so the
+/// verbose connection-info dumps skip their JSON work unless debug logging is on.
+private let cloudMatchOSLog = OSLog(subsystem: "com.owenselles.CloudNow2", category: "CloudMatch")
 
 // MARK: - CloudMatch Headers
 
@@ -177,6 +183,7 @@ private func resolutionPixels(for settings: StreamSettings) -> (width: Int, heig
 private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: String) -> [String: Any] {
     let (width, height) = resolutionPixels(for: input.settings)
     let tzOffset = TimeZone.current.secondsFromGMT() * 1000
+    let audioChannels = input.settings.audioFormat.resolvedChannelCount
     let color = input.settings.colorRequest(
         localCapabilities: .detect(codec: input.settings.codec),
         accountAllowsHDR: input.accountAllowsHDR
@@ -208,7 +215,11 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
                 "dpi": 100,
             ]],
             "useOps": true,
-            "audioMode": 2,
+            // Channel count, like the official client (audioMode = audioChannelCount).
+            // surroundAudioInfo alone only switches the TRANSPORT to multiopus; audioMode
+            // configures the rig's audio endpoint — leaving it at 2 makes games render
+            // stereo, so the rear channels of a negotiated 5.1 stream stay silent.
+            "audioMode": audioChannels,
             "metaData": [
                 ["key": "SubSessionId", "value": UUID().uuidString],
                 ["key": "wssignaling", "value": "1"],
@@ -216,11 +227,14 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
                 ["key": "networkType", "value": "Unknown"],
                 ["key": "ClientImeSupport", "value": "0"],
                 ["key": "clientPhysicalResolution", "value": "{\"horizontalPixels\":\(width),\"verticalPixels\":\(height)}"],
-                ["key": "surroundAudioInfo", "value": "2"],
+                ["key": "surroundAudioInfo", "value": "\(audioChannels)"],
             ],
             "sdrHdrMode": cloudMatchSdrHdrMode(color),
             "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
-            "surroundAudioInfo": 0,
+            // GameStream encoding (channelMask << 16) | channels: 5.1 = (0x3F << 16) | 6.
+            // 0 (unset) keeps the server's stereo default. Probe-verified: with 5.1 the
+            // server offers multiopus/48000/6 instead of stereo opus.
+            "surroundAudioInfo": audioChannels >= 6 ? 4_128_774 : 0,
             "remoteControllersBitmap": 0,
             "clientTimezoneOffset": tzOffset,
             "enhancedStreamMode": 1,
@@ -247,64 +261,48 @@ private func buildSessionRequestBody(_ input: SessionCreateRequest, deviceId: St
     ]
 }
 
-private func buildResumeSessionRequestData(appId: String?, settings: StreamSettings, deviceId: String, accountAllowsHDR: Bool?) -> [String: Any] {
-    let (width, height) = resolutionPixels(for: settings)
-    let color = settings.colorRequest(
-        localCapabilities: .detect(codec: settings.codec),
-        accountAllowsHDR: accountAllowsHDR
-    )
+private func buildResumeSessionRequestData(appId: String?, settings: StreamSettings, deviceId: String) -> [String: Any] {
+    // A RESUME (action 2) must NOT renegotiate streaming parameters: the session is already
+    // configured server-side, and resending fps/resolution/codec/HDR/monitor settings makes
+    // the server reject the claim (INTERNAL_ERROR 8A8C0000). Mirror the official client /
+    // OpenNOW minimal resume body — identity, audio, timezone, launch mode only; no monitor
+    // settings, requestedStreamingFeatures, HDR capabilities, or physical-resolution metadata.
     var requestData: [String: Any] = [
-        "availableSupportedControllers": [],
+        "audioMode": 2,
+        "remoteControllersBitmap": 0,
+        "sdrHdrMode": 0,
         "networkTestSessionId": NSNull(),
-        "parentSessionId": NSNull(),
-        "clientIdentification": "GFN-PC",
-        "deviceHashId": deviceId,
+        "availableSupportedControllers": [],
         "clientVersion": "30.0",
-        "sdkVersion": "1.0",
-        "streamerVersion": 1,
+        "deviceHashId": deviceId,
+        "internalTitle": NSNull(),
         "clientPlatformName": "windows",
-        "clientRequestMonitorSettings": [[
-            "monitorId": 0,
-            "positionX": 0,
-            "positionY": 0,
-            "widthInPixels": width,
-            "heightInPixels": height,
-            "framesPerSecond": settings.fps,
-            "sdrHdrMode": cloudMatchSdrHdrMode(color),
-            "displayData": cloudMatchDisplayData(color),
-            "hdr10PlusGamingData": NSNull(),
-            "dpi": 100,
-        ]],
-        "clientTimezoneOffset": TimeZone.current.secondsFromGMT() * 1000,
         "metaData": [
             ["key": "SubSessionId", "value": UUID().uuidString],
             ["key": "wssignaling", "value": "1"],
             ["key": "GSStreamerType", "value": "WebRTC"],
             ["key": "networkType", "value": "Unknown"],
             ["key": "ClientImeSupport", "value": "0"],
-            ["key": "clientPhysicalResolution", "value": "{\"horizontalPixels\":\(width),\"verticalPixels\":\(height)}"],
             ["key": "surroundAudioInfo", "value": "2"],
         ],
-        "sdrHdrMode": cloudMatchSdrHdrMode(color),
-        "clientDisplayHdrCapabilities": cloudMatchDisplayCapabilities(color),
+        "surroundAudioInfo": 0,
+        "clientTimezoneOffset": TimeZone.current.secondsFromGMT() * 1000,
+        "clientIdentification": "GFN-PC",
+        "parentSessionId": NSNull(),
+        "streamerVersion": 1,
         "appLaunchMode": settings.appLaunchMode.cloudMatchValue,
+        "sdkVersion": "1.0",
+        "enhancedStreamMode": 1,
+        "useOps": true,
+        "clientDisplayHdrCapabilities": NSNull(),
+        "accountLinked": true,
+        "partnerCustomData": "",
         "enablePersistingInGameSettings": settings.persistInGameSettings,
-        "requestedStreamingFeatures": [
-            "reflex": settings.fps >= 120,
-            "bitDepth": cloudMatchBitDepth(color),
-            "cloudGsync": false,
-            "enabledL4S": settings.enableL4S,
-            "profile": 0,
-            "fallbackToLogicalResolution": false,
-            "chromaFormat": cloudMatchChromaFormat(color),
-            "prefilterMode": 0,
-            "prefilterSharpness": 0,
-            "prefilterNoiseReduction": 0,
-            "hudStreamingMode": 0,
-        ],
+        "secureRTSPSupported": false,
+        "userAge": 26,
     ]
-    if let appId {
-        requestData["appId"] = appId
+    if let appId, let appIdInt = Int(appId) {
+        requestData["appId"] = appIdInt
     }
     return requestData
 }
@@ -431,8 +429,8 @@ actor CloudMatchClient {
 
         let body = buildSessionRequestBody(input, deviceId: deviceId)
         let bodyData = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-        print("[CloudMatch] bodySize: \(bodyData.count) bytes")
-        print("[CloudMatch] createSession languageCode=\(input.settings.effectiveGameLanguage) keyboardLayout=\(input.settings.keyboardLayout)")
+        cloudMatchLog.debug("[CloudMatch] bodySize: \(bodyData.count, privacy: .public) bytes")
+        cloudMatchLog.debug("[CloudMatch] createSession languageCode=\(input.settings.effectiveGameLanguage, privacy: .public) keyboardLayout=\(input.settings.keyboardLayout, privacy: .public)")
         let headers = gfnHeaders(token: input.token, clientId: clientId, deviceId: deviceId, includeOrigin: true)
         let queryItems = [
             URLQueryItem(name: "keyboardLayout", value: input.settings.keyboardLayout),
@@ -452,11 +450,11 @@ actor CloudMatchClient {
             }
             request.setValue("\(bodyData.count)", forHTTPHeaderField: "Content-Length")
             request.httpBody = bodyData
-            print("[CloudMatch] createSession POST \(params), appId=\(input.appId)")
+            cloudMatchLog.debug("[CloudMatch] createSession POST \(params, privacy: .private), appId=\(input.appId, privacy: .public)")
 
             let (data, resp) = try await urlSession.data(for: request)
             let statusCode = (resp as? HTTPURLResponse)?.statusCode ?? -1
-            print("[CloudMatch] createSession response: HTTP \(statusCode)")
+            cloudMatchLog.debug("[CloudMatch] createSession response: HTTP \(statusCode, privacy: .public)")
             if statusCode == 200 {
                 let payload = try JSONDecoder().decode(CloudMatchResponse.self, from: data)
                 try validateAPIStatus(payload, context: "createSession")
@@ -475,14 +473,14 @@ actor CloudMatchClient {
                 )
             }
             let raw = String(data: data, encoding: .utf8) ?? ""
-            print("[CloudMatch] createSession failed: HTTP \(statusCode) body: \(raw.prefix(500))")
+            cloudMatchLog.warning("[CloudMatch] createSession failed: HTTP \(statusCode, privacy: .public) body: \(raw.prefix(500), privacy: .private)")
             // Clean up phantom session the server allocated despite the error
             if let errPayload = try? JSONDecoder().decode(CloudMatchResponse.self, from: data),
                let session = errPayload.session,
                !session.sessionId.isEmpty
             {
                 let sid = session.sessionId
-                print("[CloudMatch] cleaning phantom session \(sid)")
+                cloudMatchLog.debug("[CloudMatch] cleaning phantom session \(sid, privacy: .private)")
                 try? await stopSession(
                     sessionId: sid,
                     token: input.token,
@@ -582,9 +580,9 @@ actor CloudMatchClient {
         }
         let (data, resp) = try await urlSession.data(for: request)
         let httpStatus = (resp as? HTTPURLResponse)?.statusCode ?? -1
-        print("[CloudMatch] getActiveSessions HTTP \(httpStatus), \(data.count) bytes")
-        if let raw = String(data: data, encoding: .utf8) {
-            print("[CloudMatch] getActiveSessions raw: \(raw.prefix(500))")
+        cloudMatchLog.debug("[CloudMatch] getActiveSessions HTTP \(httpStatus, privacy: .public), \(data.count, privacy: .public) bytes")
+        if cloudMatchOSLog.isEnabled(type: .debug), let raw = String(data: data, encoding: .utf8) {
+            cloudMatchLog.debug("[CloudMatch] getActiveSessions raw: \(raw.prefix(500), privacy: .private)")
         }
         try validateHTTPStatus(resp, data: data, context: "getActiveSessions")
         let decoded = try JSONDecoder().decode(GetSessionsResponse.self, from: data)
@@ -611,7 +609,7 @@ actor CloudMatchClient {
             let matches = activeSessions.filter { $0.appId == appId }
             guard !matches.isEmpty else { return }
 
-            print("[CloudMatch] stopping \(matches.count) active session(s) for appId=\(appId)")
+            cloudMatchLog.info("[CloudMatch] stopping \(matches.count, privacy: .public) active session(s) for appId=\(appId, privacy: .public)")
             for session in matches {
                 try? await stopSession(
                     sessionId: session.sessionId,
@@ -621,7 +619,7 @@ actor CloudMatchClient {
                 )
             }
         } catch {
-            print("[CloudMatch] stopActiveSessions failed: \(error)")
+            cloudMatchLog.warning("[CloudMatch] stopActiveSessions failed: \(error, privacy: .private)")
         }
     }
 
@@ -640,7 +638,7 @@ actor CloudMatchClient {
         deviceId existingDeviceId: String? = nil,
         appId: String? = nil,
         settings: StreamSettings,
-        accountAllowsHDR: Bool? = nil
+        accountAllowsHDR _: Bool? = nil
     ) async throws -> SessionInfo {
         let clientId = existingClientId ?? UUID().uuidString
         let deviceId = existingDeviceId ?? GFNDeviceIdentity.stableDeviceId()
@@ -670,12 +668,13 @@ actor CloudMatchClient {
             URLQueryItem(name: "keyboardLayout", value: settings.keyboardLayout),
             URLQueryItem(name: "languageCode", value: settings.effectiveGameLanguage),
         ]
-        print("[CloudMatch] claimSession languageCode=\(settings.effectiveGameLanguage) keyboardLayout=\(settings.keyboardLayout)")
+        cloudMatchLog.debug("[CloudMatch] claimSession languageCode=\(settings.effectiveGameLanguage, privacy: .public) keyboardLayout=\(settings.keyboardLayout, privacy: .public)")
         guard let url = comps.url else { throw CloudMatchError.sessionCreateFailed("Invalid resume URL") }
         let body: [String: Any] = [
             "action": 2,
             "data": "RESUME",
-            "sessionRequestData": buildResumeSessionRequestData(appId: appId, settings: settings, deviceId: deviceId, accountAllowsHDR: accountAllowsHDR),
+            "sessionRequestData": buildResumeSessionRequestData(appId: appId, settings: settings, deviceId: deviceId),
+            "metaData": [],
         ]
         var request = URLRequest(url: url)
         request.httpMethod = "PUT"
@@ -711,30 +710,29 @@ actor CloudMatchClient {
             throw CloudMatchError.missingSession(context: "CloudMatch response")
         }
         let connections = s.connectionInfo ?? []
-        let connInfoLog = connections.map { c -> String in
-            let ipStr = c.ip.map { $0.value ?? "value_nil" } ?? "field_nil"
-            return "usage=\(c.usage) ip=\(ipStr) port=\(c.port) path=\(c.resourcePath ?? "nil")"
-        }.joined(separator: " | ")
-        print("[CloudMatch] connectionInfo: \(connInfoLog)")
+        if cloudMatchOSLog.isEnabled(type: .debug) {
+            let connInfoLog = connections.map { c -> String in
+                let ipStr = c.ip.map { $0.value ?? "value_nil" } ?? "field_nil"
+                return "usage=\(c.usage) ip=\(ipStr) port=\(c.port) path=\(c.resourcePath ?? "nil")"
+            }.joined(separator: " | ")
+            cloudMatchLog.debug("[CloudMatch] connectionInfo: \(connInfoLog, privacy: .private)")
+        }
 
-        // Diagnostic raw JSON dump (once per active session — status==2 or 3)
+        // Diagnostic dump (once per active session — status==2 or 3). Gated on debug being
+        // enabled so the JSON re-parse never runs otherwise; values carry TURN credentials
+        // and server control info, so they're redacted unless a debugger is attached.
         if s.status == 2 || s.status == 3,
+           cloudMatchOSLog.isEnabled(type: .debug),
            let root = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any],
            let sess = root["session"] as? [String: Any]
         {
             if let iceConfig = sess["iceServerConfiguration"] {
-                if let iceData = try? JSONSerialization.data(withJSONObject: iceConfig, options: .prettyPrinted),
-                   let iceStr = String(data: iceData, encoding: .utf8)
-                {
-                    print("[CloudMatch] iceServerConfiguration:\n\(iceStr)")
-                } else {
-                    print("[CloudMatch] iceServerConfiguration: \(iceConfig)")
-                }
+                cloudMatchLog.debug("[CloudMatch] iceServerConfiguration: \(String(describing: iceConfig), privacy: .private)")
             } else {
-                print("[CloudMatch] iceServerConfiguration: absent")
+                cloudMatchLog.debug("[CloudMatch] iceServerConfiguration: absent")
             }
             if let sci = sess["sessionControlInfo"] {
-                print("[CloudMatch] sessionControlInfo: \(sci)")
+                cloudMatchLog.debug("[CloudMatch] sessionControlInfo: \(String(describing: sci), privacy: .private)")
             }
         }
 
@@ -753,7 +751,7 @@ actor CloudMatchClient {
             : rawIceServers.map { IceServer(urls: $0.urls.values, username: $0.username, credential: $0.credential) }
 
         let media = mediaConnectionInfo(from: connections, fallbackServerIp: serverIp)
-        print("[CloudMatch] mediaConnectionInfo: \(media.map { "\($0.ip):\($0.port)" } ?? "nil")")
+        cloudMatchLog.debug("[CloudMatch] mediaConnectionInfo: \(media.map { "\($0.ip):\($0.port)" } ?? "nil", privacy: .private)")
 
         // Ad state — parse raw JSON for flexibility since ad schema varies
         let adState = extractAdState(from: rawData)

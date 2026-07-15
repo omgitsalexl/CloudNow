@@ -1,4 +1,3 @@
-import Charts
 import Combine
 import os.log
 import SwiftUI
@@ -85,8 +84,9 @@ struct StreamView: View {
         }
         .onDisappear { streamController.disconnect() }
         // During streaming, VideoSurfaceView is first responder and intercepts Menu via UIKit,
-        // signaling us through menuPressCount. .onExitCommand only fires in non-streaming states
-        // (loading, error) when the focus engine is active.
+        // signaling us through menuPressCount. .onExitCommand fires when the focus engine is
+        // active: non-streaming states (loading, error) and while the pause menu holds focus —
+        // there, B/Menu closes the menu just like Resume.
         .onChange(of: streamController.menuPressCount) { _, _ in
             togglePauseMenu()
         }
@@ -94,7 +94,9 @@ struct StreamView: View {
             presentControllerTextEntry()
         }
         .onExitCommand {
-            if streamController.state != .streaming {
+            if overlayState != .none {
+                togglePauseMenu()
+            } else if streamController.state != .streaming {
                 disconnect()
             }
         }
@@ -203,8 +205,9 @@ struct StreamView: View {
 
     /// A badge shows only when the game supports the feature AND it's actually usable here:
     /// HDR requires the client's 10-bit/HDR pipeline, display, and an HDR-entitled tier; RTX
-    /// requires a premium tier; Reflex is shown whenever the game supports it. Mirrors the
-    /// official client's supportedOnGame + systemSupported + subscription gating.
+    /// requires a premium tier. Reflex is never shown: the session request only enables it
+    /// at >= 120 fps, which tvOS's 60 Hz cap rules out. Mirrors the official client's
+    /// supportedOnGame + systemSupported + subscription gating.
     private func computeLoadingBadges() {
         let supported = Set(game.supportedFeatures ?? [])
         guard !supported.isEmpty else { loadingBadges = []; return }
@@ -354,6 +357,18 @@ struct StreamView: View {
 
             if overlayState == .pauseMenu {
                 pauseMenu
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
+
+            // Stays visible while the pause menu is open (the menu is a left sidebar)
+            // so cycling the Statistics level takes effect on screen immediately.
+            // Padding must sit INSIDE the flexible frame: outside it would grow the
+            // ZStack beyond the screen and stretch the video underneath.
+            if streamController.statsMode != .off {
+                StatsHUDView(streamController: streamController)
+                    .padding(.top, 60)
+                    .padding(.trailing, 60)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .transition(.opacity)
             }
 
@@ -370,8 +385,13 @@ struct StreamView: View {
         }
         .animation(.easeInOut(duration: 0.4), value: streamController.timeWarning)
         .animation(.easeInOut(duration: 0.2), value: overlayState)
+        .animation(.easeInOut(duration: 0.2), value: streamController.statsMode)
         .onChange(of: overlayState) { _, state in
-            streamController.setOverlayInputPaused(state != .none)
+            // Keep gamepad navigation out of the stream while the pause menu owns focus;
+            // controller text entry and queued text replay always need the coordinator paused.
+            let shouldPause = state == .textEntry
+                || (state == .pauseMenu && streamController.remoteMode != .mouse)
+            streamController.setOverlayInputPaused(shouldPause)
             textEntryFocus = state == .textEntry ? .field : nil
         }
         .alert(L10n.text("end_session_title"), isPresented: $showExitConfirmation) {
@@ -384,132 +404,77 @@ struct StreamView: View {
 
     // MARK: Pause Menu
 
+    /// Left sidebar, like the official client's in-game overlay. Stats live in the
+    /// StatsHUDView on the right, which stays visible while this menu is open.
     private var pauseMenu: some View {
-        HStack(alignment: .top, spacing: 40) {
-            // Actions
-            VStack(spacing: 16) {
-                Button {
-                    closeOverlay()
-                } label: {
-                    Label(L10n.text("resume"), systemImage: "play.fill")
-                        .frame(minWidth: 180)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-
-                Button {
-                    streamController.toggleRemoteMode()
-                } label: {
-                    Label(remoteModeLabel, systemImage: remoteModeIcon)
-                        .frame(minWidth: 180)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.white)
-
-                Button {
-                    leave()
-                } label: {
-                    Label(L10n.text("leave_game"), systemImage: "house")
-                        .frame(minWidth: 180)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.white)
-
-                Button(role: .destructive) {
-                    showExitConfirmation = true
-                } label: {
-                    Label(L10n.text("end_session"), systemImage: "xmark.circle")
-                        .frame(minWidth: 180)
-                }
-                .buttonStyle(.bordered)
-                .tint(.red)
+        VStack(alignment: .leading, spacing: 16) {
+            Button {
+                togglePauseMenu()
+            } label: {
+                Label(L10n.text("resume"), systemImage: "play.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .buttonStyle(.bordered)
+            .tint(.green)
 
-            // Live stats
-            VStack(alignment: .leading, spacing: 10) {
-                if streamController.statsMode == .off {
-                    Label(L10n.text("statistics_disabled"), systemImage: "chart.bar.xaxis")
-                        .foregroundStyle(.secondary)
-                } else {
-                    metricRow(
-                        icon: "network",
-                        label: L10n.text("rtt"),
-                        value: "\(Int(streamController.stats.rttMs)) ms",
-                        history: streamController.pingHistory,
-                        color: pingColor(streamController.stats.rttMs)
-                    )
-                    metricRow(
-                        icon: "speedometer",
-                        label: L10n.text("fps"),
-                        value: "\(Int(streamController.stats.fps))",
-                        history: streamController.fpsHistory,
-                        color: fpsColor(streamController.stats.fps)
-                    )
-                    metricRow(
-                        icon: "wifi",
-                        label: L10n.text("bitrate"),
-                        value: "\(streamController.stats.bitrateKbps / 1000) Mbps",
-                        history: streamController.bitrateHistory,
-                        color: .cyan
-                    )
-                    Divider().overlay(.white.opacity(0.4))
-                    Label(
-                        L10n.format("resolution_fps_status", streamController.stats.resolutionWidth, streamController.stats.resolutionHeight, Int(streamController.stats.fps)),
-                        systemImage: "tv"
-                    )
-                    Label(
-                        L10n.format("loss_status", L10n.text("loss"), String(format: "%.1f", streamController.stats.packetLossPercent)),
-                        systemImage: "arrow.triangle.2.circlepath"
-                    )
-                    Label(L10n.text(streamController.stats.selectedNetworkPath), systemImage: "point.3.connected.trianglepath.dotted")
-                    Label(
-                        L10n.format(
-                            "input_queue_status",
-                            String(format: "%.1f", streamController.stats.inputQueueP95Ms),
-                            String(streamController.stats.inputBufferedBytes)
-                        ),
-                        systemImage: "gamecontroller"
-                    )
-                    if streamController.stats.inputDropped > 0 {
-                        Label(
-                            L10n.format("input_drops_status", streamController.stats.inputDropped),
-                            systemImage: "exclamationmark.triangle"
-                        )
-                        .foregroundStyle(.orange)
-                    }
-                    if streamController.stats.inputSuperseded > 0 {
-                        Label(
-                            L10n.format("analog_snapshots_coalesced_status", streamController.stats.inputSuperseded),
-                            systemImage: "arrow.triangle.merge"
-                        )
-                        .foregroundStyle(.secondary)
-                    }
-                    if !streamController.stats.gpuType.isEmpty {
-                        Label(streamController.stats.gpuType, systemImage: "cpu")
-                    }
-                    if let sub = viewModel.subscription, !sub.isUnlimited, let rem = sub.remainingMinutes {
-                        Divider().overlay(.white.opacity(0.4))
-                        Label {
-                            Text(rem >= 60 ? "\(rem / 60)h \(rem % 60)m remaining" : "\(rem)m remaining")
-                        } icon: {
-                            Image(systemName: "clock")
-                                .foregroundStyle(rem < 30 ? .orange : .white.opacity(0.7))
-                        }
-                        .foregroundStyle(rem < 30 ? .orange : .white)
-                    }
-                }
-
-                if streamController.statsMode == .diagnostic {
-                    diagnosticRows
-                }
+            Button {
+                streamController.toggleRemoteMode()
+            } label: {
+                Label(remoteModeLabel, systemImage: remoteModeIcon)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .font(.caption.weight(.medium))
-            .foregroundStyle(.white)
+            .buttonStyle(.bordered)
+
+            Button {
+                let next = streamController.statsMode.nextHUDLevel
+                streamController.setStatsMode(next)
+                viewModel.streamSettings.statsMode = next
+                viewModel.saveSettings()
+            } label: {
+                Label(
+                    L10n.format("statistics_level", streamController.statsMode.label),
+                    systemImage: "chart.bar.xaxis"
+                )
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                leave()
+            } label: {
+                Label(L10n.text("leave_game"), systemImage: "house")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            Button(role: .destructive) {
+                showExitConfirmation = true
+            } label: {
+                Label(L10n.text("end_session"), systemImage: "xmark.circle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+
+            Spacer()
+
+            if let sub = viewModel.subscription, !sub.isUnlimited, let rem = sub.remainingMinutes {
+                Label {
+                    Text(rem >= 60 ? "\(rem / 60)h \(rem % 60)m remaining" : "\(rem)m remaining")
+                } icon: {
+                    Image(systemName: "clock")
+                }
+                .font(.caption.weight(.medium))
+                .foregroundStyle(rem < 30 ? .orange : .white.opacity(0.8))
+            }
         }
-        .padding(32)
-        .background(.black.opacity(0.75), in: RoundedRectangle(cornerRadius: 16))
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-        .padding(60)
+        .padding(.horizontal, 48)
+        .padding(.vertical, 80)
+        .frame(width: 480)
+        .frame(maxHeight: .infinity)
+        .background(.black.opacity(0.75))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        .ignoresSafeArea()
     }
 
     private var controllerTextEntryOverlay: some View {
@@ -581,118 +546,6 @@ struct StreamView: View {
         .shadow(color: .black.opacity(0.4), radius: 32, y: 14)
     }
 
-    private var diagnosticRows: some View {
-        let pipeline = streamController.videoDiagnostics
-        return Group {
-            Divider().overlay(.white.opacity(0.4))
-            if !streamController.diagnosticSessionSummary.isEmpty {
-                Label(
-                    streamController.diagnosticSessionSummary,
-                    systemImage: "dot.radiowaves.left.and.right"
-                )
-            }
-            Label(
-                L10n.format(
-                    "jitter_buffer_status",
-                    formatMs(streamController.stats.jitterBufferDelayMs),
-                    formatMs(streamController.stats.jitterBufferTargetDelayMs)
-                ),
-                systemImage: "waveform.path"
-            )
-            Label(
-                L10n.format(
-                    "decode_process_status",
-                    formatMs(streamController.stats.decodeTimeMs),
-                    formatMs(streamController.stats.processingDelayMs)
-                ),
-                systemImage: "cpu"
-            )
-            Label(
-                L10n.format(
-                    "app_queue_status",
-                    pipeline.enqueuedFrames,
-                    pipeline.droppedFrames,
-                    pipeline.backpressureEvents
-                ),
-                systemImage: "rectangle.stack"
-            )
-            Label(
-                L10n.format(
-                    "sample_and_convert_status",
-                    formatMs(pipeline.averageSampleCreationMs),
-                    formatMs(pipeline.averageConversionMs)
-                ),
-                systemImage: "timer"
-            )
-            Label(
-                L10n.displayLayerMetrics(
-                    totalFrames: pipeline.avTotalFrames,
-                    droppedFrames: pipeline.avDroppedFrames,
-                    corruptedFrames: pipeline.avCorruptedFrames,
-                    accumulatedFrameDelayMs: pipeline.avAccumulatedFrameDelayMs
-                ),
-                systemImage: "display"
-            )
-            if !streamController.stats.decoderImplementation.isEmpty {
-                Label(
-                    L10n.format(
-                        "decoder_implementation_status",
-                        streamController.stats.decoderImplementation,
-                        streamController.stats.powerEfficientDecoder == true ? L10n.text("hardware") : ""
-                    ),
-                    systemImage: "video"
-                )
-            }
-            Label(
-                L10n.colorDiagnosticStatus(
-                    preference: streamController.colorState.preference.label,
-                    requested: L10n.streamColorModeLabel(streamController.colorState.requestedMode),
-                    detected: {
-                        if let format = pipeline.decodedVideoFormat {
-                            return L10n.detectedColorModeLabel(format.mode)
-                        }
-                        if let detected = streamController.colorState.detectedMode {
-                            return L10n.detectedColorModeLabel(detected)
-                        }
-                        return L10n.text("unknown")
-                    }(),
-                    display: L10n.hdrSupportLabel(streamController.colorState.displayHDRSupport)
-                ),
-                systemImage: "circle.lefthalf.filled"
-            )
-            if let fallback = streamController.colorState.fallbackReason {
-                Label(
-                    "\(L10n.text("fallback")) \(L10n.colorFallbackReasonLabel(fallback))",
-                    systemImage: "arrow.down.right.circle"
-                )
-                .foregroundStyle(.orange)
-            }
-            if let format = pipeline.decodedVideoFormat {
-                Label(
-                    L10n.decodedVideoStatus(
-                        decoderPath: L10n.decoderPathLabel(format.decoderPath),
-                        mode: L10n.detectedColorModeLabel(format.mode),
-                        width: format.width,
-                        height: format.height,
-                        pixelFormatName: format.pixelFormatName,
-                        bitDepth: format.bitDepth.map { "\($0)-bit" } ?? L10n.text("unknown_bit_depth"),
-                        metadataSummary: format.metadataDiagnosticSummary
-                    ),
-                    systemImage: "scope"
-                )
-            }
-            if streamController.rtcEventLogURL != nil {
-                Label(L10n.text("rtc_event_log_active"), systemImage: "doc.text.magnifyingglass")
-            }
-        }
-        .font(.caption2.monospacedDigit())
-        .foregroundStyle(.white.opacity(0.85))
-    }
-
-    private func formatMs(_ value: Double) -> String {
-        String(format: "%.2f ms", value)
-    }
-
     private var remoteModeLabel: String {
         L10n.remoteInputModeLabel(streamController.remoteMode)
     }
@@ -703,51 +556,6 @@ struct StreamView: View {
         case .gamepad: "gamecontroller"
         case .dualsense: "hand.point.up.left"
         }
-    }
-
-    private func metricRow(icon: String, label: String, value: String, history: [Double], color: Color) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon)
-                .foregroundStyle(color)
-                .frame(width: 16)
-            Text("\(label): \(value)")
-                .foregroundStyle(color)
-                .frame(width: 130, alignment: .leading)
-            if history.count > 1 {
-                Chart {
-                    ForEach(Array(history.enumerated()), id: \.offset) { idx, val in
-                        LineMark(x: .value("t", idx), y: .value("v", val))
-                            .foregroundStyle(color)
-                    }
-                }
-                .chartXAxis(.hidden)
-                .chartYAxis(.hidden)
-                .frame(width: 80, height: 24)
-            }
-        }
-    }
-
-    private func pingColor(_ ms: Double) -> Color {
-        if ms < 30 {
-            return .green
-        }
-        if ms < 80 {
-            return .yellow
-        }
-        if ms < 150 {
-            return .orange
-        }
-        return .red
-    }
-
-    private func fpsColor(_ fps: Double) -> Color {
-        if fps >= 55 {
-            return .green
-        }
-        if fps >= 30 {
-            return .yellow
-        }
-        return .red
     }
 
     // MARK: Time Warning Banner
@@ -820,17 +628,28 @@ struct StreamView: View {
         statusView(
             icon: "exclamationmark.triangle",
             title: L10n.text("stream_failed"),
-            message: entitlementMessage(from: message),
+            message: friendlyFailureMessage(from: message),
             color: .red
         )
     }
 
-    private func entitlementMessage(from raw: String) -> String {
-        if raw.uppercased().contains("ENTITLEMENT") || raw.contains("3237093650") {
+    private func friendlyFailureMessage(from raw: String) -> String {
+        let upper = raw.uppercased()
+        if upper.contains("ENTITLEMENT") || raw.contains("3237093650") {
             return L10n.format("not_in_library", game.title)
         }
-        if raw.contains("SESSION_LIMIT_EXCEEDED") {
+        if upper.contains("SESSION_LIMIT_EXCEEDED") {
             return L10n.text("previous_session_still_active")
+        }
+        // Never surface the raw JSON body on the failure screen: when the payload carries
+        // a CloudMatch status phrase (e.g. "REQUEST_LIMIT_EXCEEDED_STATUS"), show just that.
+        if let range = raw.range(of: "\"statusDescription\":\""),
+           let end = raw[range.upperBound...].firstIndex(of: "\"")
+        {
+            let phrase = raw[range.upperBound ..< end].trimmingCharacters(in: .whitespaces)
+            if !phrase.isEmpty {
+                return phrase
+            }
         }
         return raw
     }
@@ -950,11 +769,15 @@ struct StreamView: View {
                 streamLog.info("startSession: direct path ready, connecting WebRTC")
                 viewModel.recordPlayed(game)
                 await streamController.connect(session: sessionInfo, settings: settings, accountAllowsHDR: viewModel.subscription?.allowsHDR)
+                return
             } catch {
-                streamLog.error("startSession: direct path failed: \(error)")
-                streamController.fail(with: error.localizedDescription)
+                // Resume/claim failed — the saved session has almost certainly expired
+                // server-side. Drop the stale resume offer and fall through to create a
+                // fresh session rather than dead-ending on a raw server error.
+                streamLog.error("startSession: direct path failed: \(error, privacy: .private); falling back to a fresh session")
+                viewModel.resumableSession = nil
+                createdSession = nil
             }
-            return
         }
 
         // Stop any previously created server session before opening a new one.
@@ -1019,7 +842,7 @@ struct StreamView: View {
 
                 // Check for a locally saved session for this game — resume instead of creating new.
                 if let last = viewModel.lastSession, last.appId == appId {
-                    print("[Resume] found saved session \(last.sessionId) for appId=\(appId), trying resume")
+                    streamLog.info("[Resume] found saved session \(last.sessionId, privacy: .private) for appId=\(appId, privacy: .public), trying resume")
                     do {
                         sessionInfo = try await cloudMatchClient.claimSession(
                             sessionId: last.sessionId,
@@ -1033,10 +856,10 @@ struct StreamView: View {
                             settings: settings,
                             accountAllowsHDR: viewModel.subscription?.allowsHDR
                         )
-                        print("[Resume] claimed session, status=\(sessionInfo.status)")
+                        streamLog.info("[Resume] claimed session, status=\(sessionInfo.status, privacy: .public)")
                         createdSession = sessionInfo
                     } catch {
-                        print("[Resume] claim failed: \(error), stopping old session and creating new")
+                        streamLog.warning("[Resume] claim failed: \(error, privacy: .private), stopping old session and creating new")
                         try? await cloudMatchClient.stopSession(
                             sessionId: last.sessionId,
                             token: token,
@@ -1051,7 +874,7 @@ struct StreamView: View {
                     }
                 } else {
                     if let last = viewModel.lastSession {
-                        print("[Resume] saved session appId=\(last.appId) != game appId=\(appId), stopping it")
+                        streamLog.info("[Resume] saved session appId=\(last.appId, privacy: .public) != game appId=\(appId, privacy: .public), stopping it")
                         try? await cloudMatchClient.stopSession(
                             sessionId: last.sessionId,
                             token: token,
@@ -1178,17 +1001,26 @@ struct StreamView: View {
         // Intentional end — clear any pending resumable session
         viewModel.resumableSession = nil
         viewModel.clearLastSession()
-        // Tell the server to stop the session so it doesn't linger
-        if let session = createdSession, let token = sessionToken {
-            Task {
-                try? await cloudMatchClient.stopSession(
-                    sessionId: session.sessionId,
-                    token: token,
-                    base: session.streamingBaseUrl,
-                    serverIp: session.serverIp.isEmpty ? nil : session.serverIp,
-                    clientId: session.clientId,
-                    deviceId: session.deviceId
-                )
+        if let session = createdSession {
+            // Drop the session from Home immediately: the refresh fired by the
+            // dismissal below races the stop request, and the server keeps
+            // listing a stopped session for a few seconds.
+            viewModel.markSessionStopped(session.sessionId)
+            // Tell the server to stop the session so it doesn't linger
+            if let token = sessionToken {
+                Task {
+                    try? await cloudMatchClient.stopSession(
+                        sessionId: session.sessionId,
+                        token: token,
+                        base: session.streamingBaseUrl,
+                        serverIp: session.serverIp.isEmpty ? nil : session.serverIp,
+                        clientId: session.clientId,
+                        deviceId: session.deviceId
+                    )
+                    // Converge to server truth once the stop has actually landed
+                    // (the grace window still excludes the stopped id).
+                    await viewModel.refreshActiveSessions(authManager: authManager)
+                }
             }
         }
         streamController.disconnect()
@@ -1203,7 +1035,7 @@ struct StreamView: View {
         } else {
             (base, nil)
         }
-        print("[Session] creating new session, appId=\(appId), sessionBase=\(routeSelection.base), routingZoneUrl=\(routeSelection.routingZoneUrl ?? "nil")")
+        streamLog.info("[Session] creating new session, appId=\(appId, privacy: .public), sessionBase=\(routeSelection.base, privacy: .public), routingZoneUrl=\(routeSelection.routingZoneUrl ?? "nil", privacy: .public)")
 
         let request = SessionCreateRequest(
             appId: appId,
@@ -1218,16 +1050,16 @@ struct StreamView: View {
 
         do {
             let sessionInfo = try await cloudMatchClient.createSession(request)
-            print("[Session] created, sessionId=\(sessionInfo.sessionId), status=\(sessionInfo.status)")
+            streamLog.info("[Session] created, sessionId=\(sessionInfo.sessionId, privacy: .private), status=\(sessionInfo.status, privacy: .public)")
             return sessionInfo
         } catch {
             guard shouldForceStopExistingSession(error) else { throw error }
 
-            print("[Session] active session conflict detected for appId=\(appId), stopping matches and retrying once")
+            streamLog.warning("[Session] active session conflict detected for appId=\(appId, privacy: .public), stopping matches and retrying once")
             await cloudMatchClient.stopActiveSessions(matchingAppId: appId, token: token, base: routeSelection.base)
 
             let sessionInfo = try await cloudMatchClient.createSession(request)
-            print("[Session] created after conflict cleanup, sessionId=\(sessionInfo.sessionId), status=\(sessionInfo.status)")
+            streamLog.info("[Session] created after conflict cleanup, sessionId=\(sessionInfo.sessionId, privacy: .private), status=\(sessionInfo.status, privacy: .public)")
             return sessionInfo
         }
     }
@@ -1266,15 +1098,6 @@ struct StreamView: View {
             return
         }
         overlayState = overlayState == .pauseMenu ? .none : .pauseMenu
-    }
-
-    private func closeOverlay() {
-        if overlayState == .textEntry {
-            streamController.cancelControllerTextEntry()
-            textEntryText = ""
-            textEntryValidationMessage = nil
-        }
-        overlayState = .none
     }
 
     private func presentControllerTextEntry() {

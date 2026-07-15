@@ -1,3 +1,4 @@
+import AVFAudio
 import Foundation
 
 // MARK: - Stream Settings
@@ -62,8 +63,12 @@ struct StreamSettings: Codable, Equatable {
     /// Long-press the button that is NOT the overlay trigger to send Shift+Tab (opens the
     /// Steam in-game overlay). e.g. with overlay on Start, long-press View/Back triggers Steam.
     var enableSteamOverlayGesture: Bool = true
-    /// Controls receiver statistics collection. Diagnostic mode also enables video-pipeline tracing.
-    var statsMode: StreamStatsMode = .hud
+    /// Level of the in-game statistics HUD (cycled from the pause menu, like the
+    /// official client's Statistics overlay).
+    var statsMode: StreamStatsMode = .off
+    /// Developer diagnostics: video-pipeline tracing, AudioSync logging, debug stats rows,
+    /// and RTC event log eligibility. Independent of the statistics HUD level.
+    var diagnosticsEnabled: Bool = false
     /// Captures a bounded WebRTC event log for the duration of the next stream.
     var enableRtcEventLog: Bool = false
     /// How the GFN server presents launched games. Big Picture requests the "GamepadFriendly"
@@ -73,10 +78,13 @@ struct StreamSettings: Codable, Equatable {
     /// Persist in-game graphics settings across sessions on the cloud rig. A premium-tier
     /// (Performance/Ultimate) feature; the server ignores the flag for non-entitled accounts.
     var persistInGameSettings: Bool = true
+    /// Requested audio channel layout. Automatic follows the connected audio system's
+    /// capability (5.1 only when the route reports ≥6 output channels).
+    var audioFormat: AudioFormatPreference = .automatic
 
     var normalizedForClient: StreamSettings {
         var normalized = self
-        if normalized.statsMode != .diagnostic {
+        if !normalized.diagnosticsEnabled {
             normalized.enableRtcEventLog = false
         }
         return normalized
@@ -101,9 +109,10 @@ extension StreamSettings {
         case rumbleEnabled, rumbleIntensity
         case defaultRemoteInputMode, preferredZoneUrl
         case enableSteamOverlayGesture
-        case statsMode, enableRtcEventLog
+        case statsMode, diagnosticsEnabled, enableRtcEventLog
         case appLaunchMode
         case persistInGameSettings
+        case audioFormat
         case colorQuality
     }
 
@@ -131,10 +140,22 @@ extension StreamSettings {
         defaultRemoteInputMode = try c.decodeIfPresent(RemoteInputMode.self, forKey: .defaultRemoteInputMode) ?? d.defaultRemoteInputMode
         preferredZoneUrl = try c.decodeIfPresent(String.self, forKey: .preferredZoneUrl)
         enableSteamOverlayGesture = try c.decodeIfPresent(Bool.self, forKey: .enableSteamOverlayGesture) ?? d.enableSteamOverlayGesture
-        statsMode = try c.decodeIfPresent(StreamStatsMode.self, forKey: .statsMode) ?? d.statsMode
+        // statsMode is decoded as a raw string: older builds persisted "hud" (pause-menu-only
+        // stats, now unconditional → .off) and "diagnostic" (now the separate diagnosticsEnabled
+        // flag, with the HUD at .standard so those users keep full visibility).
+        let rawStatsMode = (try? c.decodeIfPresent(String.self, forKey: .statsMode)) ?? nil
+        switch rawStatsMode {
+        case "hud": statsMode = .off
+        case "diagnostic": statsMode = .standard
+        case let raw?: statsMode = StreamStatsMode(rawValue: raw) ?? d.statsMode
+        case nil: statsMode = d.statsMode
+        }
+        let storedDiagnostics = try c.decodeIfPresent(Bool.self, forKey: .diagnosticsEnabled)
+        diagnosticsEnabled = rawStatsMode == "diagnostic" || (storedDiagnostics ?? d.diagnosticsEnabled)
         enableRtcEventLog = try c.decodeIfPresent(Bool.self, forKey: .enableRtcEventLog) ?? d.enableRtcEventLog
         appLaunchMode = try c.decodeIfPresent(AppLaunchMode.self, forKey: .appLaunchMode) ?? d.appLaunchMode
         persistInGameSettings = try c.decodeIfPresent(Bool.self, forKey: .persistInGameSettings) ?? d.persistInGameSettings
+        audioFormat = try c.decodeIfPresent(AudioFormatPreference.self, forKey: .audioFormat) ?? d.audioFormat
     }
 
     func encode(to encoder: Encoder) throws {
@@ -158,22 +179,35 @@ extension StreamSettings {
         try c.encodeIfPresent(preferredZoneUrl, forKey: .preferredZoneUrl)
         try c.encode(enableSteamOverlayGesture, forKey: .enableSteamOverlayGesture)
         try c.encode(statsMode, forKey: .statsMode)
+        try c.encode(diagnosticsEnabled, forKey: .diagnosticsEnabled)
         try c.encode(enableRtcEventLog, forKey: .enableRtcEventLog)
         try c.encode(appLaunchMode, forKey: .appLaunchMode)
         try c.encode(persistInGameSettings, forKey: .persistInGameSettings)
+        try c.encode(audioFormat, forKey: .audioFormat)
     }
 }
 
+/// Level of the in-game statistics HUD, mirroring the official client's Statistics
+/// overlay (Off → Compact → Standard).
 enum StreamStatsMode: String, Codable, CaseIterable {
     case off
-    case hud
-    case diagnostic
+    case compact
+    case standard
 
     var label: String {
         switch self {
         case .off: L10n.text("off")
-        case .hud: L10n.text("hud")
-        case .diagnostic: L10n.text("diagnostic")
+        case .compact: L10n.text("compact")
+        case .standard: L10n.text("standard")
+        }
+    }
+
+    /// Pause-menu cycle order, matching the official client's stats hotkey.
+    var nextHUDLevel: StreamStatsMode {
+        switch self {
+        case .off: .compact
+        case .compact: .standard
+        case .standard: .off
         }
     }
 }
@@ -268,6 +302,38 @@ enum AppLaunchMode: String, Codable, CaseIterable {
 
     var label: String {
         L10n.appLaunchModeLabel(self)
+    }
+}
+
+enum AudioFormatPreference: String, Codable, CaseIterable {
+    case automatic
+    case stereo
+    case surround51
+
+    var label: String {
+        switch self {
+        case .automatic: L10n.text("automatic")
+        case .stereo: L10n.text("stereo")
+        case .surround51: L10n.text("surround_5_1")
+        }
+    }
+
+    /// Output channels to request from GFN (2 or 6). tvOS exposes no reliable sink-capability
+    /// API (device-verified: the port's channel count reports the currently active format —
+    /// always 2 before anything requests more — and maximumOutputNumberOfChannels reports the
+    /// OS mixer's 32 on one setup but the sink chain's 8 on another). Automatic therefore
+    /// requests 5.1 on any surround-capable route and lets tvOS downmix to the actual
+    /// speakers — the benign failure mode: real 5.1 rooms get discrete surround, stereo
+    /// rooms get the same graceful 6→2 downmix every video app uses for 5.1 content.
+    var resolvedChannelCount: Int {
+        switch self {
+        case .stereo:
+            2
+        case .surround51:
+            6
+        case .automatic:
+            AVAudioSession.sharedInstance().maximumOutputNumberOfChannels >= 6 ? 6 : 2
+        }
     }
 }
 
@@ -606,7 +672,7 @@ struct ActiveSessionInfo {
 
 // MARK: - Subscription / Entitlements
 
-struct EntitledResolution: Equatable {
+struct EntitledResolution: Equatable, Codable {
     let widthInPixels: Int
     let heightInPixels: Int
     let framesPerSecond: Int
@@ -616,7 +682,7 @@ struct EntitledResolution: Equatable {
     }
 }
 
-struct SubscriptionInfo {
+struct SubscriptionInfo: Codable {
     let membershipTier: String
     let isUnlimited: Bool
     let remainingMinutes: Int?
@@ -649,7 +715,7 @@ struct SubscriptionInfo {
 /// A streaming feature GFN surfaces as a loading-screen badge. Matches the three feature keys
 /// the official client shows there (RTX_ENABLED, HDR, REFLEX_ENABLED); labels are brand terms
 /// shown untranslated. Symbols are Apple SF Symbols to avoid third-party badge artwork.
-enum GameFeature: String, Codable, CaseIterable {
+enum GameFeature: String, Codable, CaseIterable, Hashable {
     case rtx
     case hdr
     case reflex
@@ -674,6 +740,11 @@ enum GameFeature: String, Codable, CaseIterable {
 struct GameInfo: Identifiable, Equatable, Codable {
     let id: String
     let title: String
+    let longDescription: String?
+    var genres: [String]?
+    let developer: String?
+    let publisher: String?
+    let contentRating: String?
     let boxArtUrl: String?
     /// Wide 16:9 banner (GFN TV_BANNER) for tiles and Home rows.
     let heroBannerUrl: String?
@@ -683,6 +754,7 @@ struct GameInfo: Identifiable, Equatable, Codable {
     /// Streaming features the game supports (RTX/HDR/Reflex), from GFN's per-variant feature flags.
     /// Optional Codable field: absent in older persisted JSON → nil.
     let supportedFeatures: [GameFeature]?
+    var screenshots: [String]
     var isInLibrary: Bool
     var variants: [GameVariant]
 
@@ -701,6 +773,99 @@ struct GameInfo: Identifiable, Equatable, Codable {
     }
 }
 
+extension GameInfo {
+    var genreCodes: [String] {
+        Array(Set((genres ?? []).map(Self.normalizedGenreCode).filter { !$0.isEmpty })).sorted()
+    }
+
+    var genreItems: [String] {
+        let mapped = genreCodes.map { GameInfo.genreLabel($0) }
+        return mapped.isEmpty ? variants.map(\.storeName) : mapped
+    }
+
+    static func genreLabel(_ code: String) -> String {
+        let normalizedCode = normalizedGenreCode(code)
+        return switch normalizedCode {
+        case "ACTION": L10n.text("genre_action")
+        case "ADVENTURE": L10n.text("genre_adventure")
+        case "ARCADE": L10n.text("genre_arcade")
+        case "FAMILY": L10n.text("genre_family")
+        case "FIRST_PERSON_SHOOTER": L10n.text("genre_first_person_shooter")
+        case "FREE_TO_PLAY": L10n.text("genre_free_to_play")
+        case "ROLE_PLAYING": L10n.text("genre_role_playing")
+        case "STRATEGY": L10n.text("genre_strategy")
+        case "SPORTS": L10n.text("genre_sports")
+        case "RACING": L10n.text("genre_racing")
+        case "SIMULATION": L10n.text("genre_simulation")
+        case "PUZZLE": L10n.text("genre_puzzle")
+        case "SHOOTER": L10n.text("genre_shooter")
+        case "FIGHTING": L10n.text("genre_fighting")
+        case "PLATFORMER": L10n.text("genre_platformer")
+        case "HORROR": L10n.text("genre_horror")
+        case "CASUAL": L10n.text("genre_casual")
+        case "INDIE": L10n.text("genre_indie")
+        case "MASSIVELY_MULTIPLAYER", "MASSIVELY_MULTIPLAYER_ONLINE": L10n.text("genre_mmo")
+        case "MULTIPLAYER_ONLINE_BATTLE_ARENA": L10n.text("genre_moba")
+        case "TECH_DEMO": L10n.text("genre_tech_demo")
+        default: normalizedCode.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    private nonisolated static func normalizedGenreCode(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .joined(separator: "_")
+    }
+}
+
+// MARK: - Game cache compatibility
+
+extension GameInfo {
+    private enum CodingKeys: String, CodingKey {
+        case id, title, longDescription, genres, developer, publisher, contentRating
+        case boxArtUrl, heroBannerUrl, heroImageUrl, supportedFeatures, screenshots
+        case isInLibrary, variants
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        longDescription = try c.decodeIfPresent(String.self, forKey: .longDescription)
+        genres = try c.decodeIfPresent([String].self, forKey: .genres)
+        developer = try c.decodeIfPresent(String.self, forKey: .developer)
+        publisher = try c.decodeIfPresent(String.self, forKey: .publisher)
+        contentRating = try c.decodeIfPresent(String.self, forKey: .contentRating)
+        boxArtUrl = try c.decodeIfPresent(String.self, forKey: .boxArtUrl)
+        heroBannerUrl = try c.decodeIfPresent(String.self, forKey: .heroBannerUrl)
+        heroImageUrl = try c.decodeIfPresent(String.self, forKey: .heroImageUrl)
+        supportedFeatures = try c.decodeIfPresent([GameFeature].self, forKey: .supportedFeatures)
+        screenshots = try c.decodeIfPresent([String].self, forKey: .screenshots) ?? []
+        isInLibrary = try c.decode(Bool.self, forKey: .isInLibrary)
+        variants = try c.decode([GameVariant].self, forKey: .variants)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(title, forKey: .title)
+        try c.encodeIfPresent(longDescription, forKey: .longDescription)
+        try c.encodeIfPresent(genres, forKey: .genres)
+        try c.encodeIfPresent(developer, forKey: .developer)
+        try c.encodeIfPresent(publisher, forKey: .publisher)
+        try c.encodeIfPresent(contentRating, forKey: .contentRating)
+        try c.encodeIfPresent(boxArtUrl, forKey: .boxArtUrl)
+        try c.encodeIfPresent(heroBannerUrl, forKey: .heroBannerUrl)
+        try c.encodeIfPresent(heroImageUrl, forKey: .heroImageUrl)
+        try c.encodeIfPresent(supportedFeatures, forKey: .supportedFeatures)
+        try c.encode(screenshots, forKey: .screenshots)
+        try c.encode(isInLibrary, forKey: .isInLibrary)
+        try c.encode(variants, forKey: .variants)
+    }
+}
+
 struct GameVariant: Equatable, Codable {
     let id: String
     let appStore: String
@@ -710,6 +875,28 @@ struct GameVariant: Equatable, Codable {
 
     var storeName: String {
         L10n.storeName(for: appStore)
+    }
+}
+
+extension GameVariant {
+    private enum CodingKeys: String, CodingKey {
+        case id, appStore, appId, isOwned
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        appStore = try c.decode(String.self, forKey: .appStore)
+        appId = try c.decodeIfPresent(String.self, forKey: .appId)
+        isOwned = try c.decodeIfPresent(Bool.self, forKey: .isOwned) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(appStore, forKey: .appStore)
+        try c.encodeIfPresent(appId, forKey: .appId)
+        try c.encode(isOwned, forKey: .isOwned)
     }
 }
 

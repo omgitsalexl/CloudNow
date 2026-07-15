@@ -1,4 +1,7 @@
 import Foundation
+import os.log
+
+private let gamesLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Games")
 
 struct LibraryFetchResult {
     let games: [GameInfo]
@@ -26,7 +29,7 @@ actor GamesClient {
         apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, filters: $filters) {
             numberReturned pageInfo { hasNextPage endCursor totalCount }
             items {
-                id title
+                id title genres
                 images { GAME_BOX_ART TV_BANNER HERO_IMAGE }
                 variants { id appStore supportedControls gfn { status library { status selected } features { __typename ... on GfnSubscriptionFeatureInterface { key } ... on GfnSubscriptionFeatureValue { value } ... on GfnSubscriptionFeatureValueList { values } } } }
                 gfn { playabilityState minimumMembershipTierLabel }
@@ -40,7 +43,7 @@ actor GamesClient {
         apps(vpcId: $vpcId, language: $locale, orderBy: $sortString, first: $fetchCount, after: $cursor, searchQuery: $searchString, filters: $filters) {
             numberReturned pageInfo { hasNextPage endCursor totalCount }
             items {
-                id title
+                id title genres
                 images { GAME_BOX_ART TV_BANNER HERO_IMAGE }
                 variants { id appStore supportedControls gfn { status library { status selected } features { __typename ... on GfnSubscriptionFeatureInterface { key } ... on GfnSubscriptionFeatureValue { value } ... on GfnSubscriptionFeatureValueList { values } } } }
                 gfn { playabilityState minimumMembershipTierLabel }
@@ -49,27 +52,91 @@ actor GamesClient {
     }
     """
 
+    /// Older regional GraphQL deployments may not expose genres on browse results yet.
+    /// Retrying without this field preserves catalog loading while simply hiding genre filters.
+    private static let browseQueryWithoutGenres = browseQuery.replacingOccurrences(of: "id title genres", with: "id title")
+    private static let searchQueryWithoutGenres = searchQuery.replacingOccurrences(of: "id title genres", with: "id title")
+
     // MARK: Fetch Full Catalog (browse API)
 
-    func fetchMainGames(token: String, streamingBaseUrl: String = NVIDIAAuth.defaultStreamingUrl) async throws -> [GameInfo] {
-        let vpcId = await (try? fetchVpcId(token: token, baseUrl: streamingBaseUrl)) ?? "GFN-PC"
+    func fetchMainGames(token: String, streamingBaseUrl: String = NVIDIAAuth.defaultStreamingUrl, vpcId: String? = nil) async throws -> [GameInfo] {
+        let vpcId = await resolveVpcId(vpcId, token: token, baseUrl: streamingBaseUrl)
+        // The public catalog is independent of the browse pagination — fetch both at once.
+        async let publicTask = fetchPublicCatalog()
         let games = try await browseCatalog(token: token, vpcId: vpcId, filters: [:], maxPages: 15)
-        let publicGames = await (try? fetchPublicCatalog()) ?? []
+        let publicGames = await (try? publicTask) ?? []
         return mergeCatalog(games, supplemental: publicGames)
     }
 
     // MARK: Fetch Library (owned/purchased games via browse filter)
 
-    func fetchLibrary(token: String, streamingBaseUrl: String = NVIDIAAuth.defaultStreamingUrl) async throws -> [GameInfo] {
-        let vpcId = await (try? fetchVpcId(token: token, baseUrl: streamingBaseUrl)) ?? "GFN-PC"
+    func fetchLibrary(token: String, streamingBaseUrl: String = NVIDIAAuth.defaultStreamingUrl, vpcId: String? = nil) async throws -> [GameInfo] {
+        let vpcId = await resolveVpcId(vpcId, token: token, baseUrl: streamingBaseUrl)
         let libraryFilter: [String: Any] = ["variants": ["gfn": ["library": ["status": ["notEquals": "NOT_OWNED"]]]]]
         let games = try await browseCatalog(token: token, vpcId: vpcId, filters: libraryFilter, maxPages: 10)
         return await (try? enrich(token: token, vpcId: vpcId, games: games)) ?? games
     }
 
+    /// Callers that load catalog, library, and subscription together fetch the vpcId
+    /// once and pass it in; standalone calls fall back to fetching it here.
+    private func resolveVpcId(_ provided: String?, token: String, baseUrl: String) async -> String {
+        if let provided, !provided.isEmpty {
+            return provided
+        }
+        return await (try? fetchVpcId(token: token, baseUrl: baseUrl)) ?? "GFN-PC"
+    }
+
     // MARK: - Catalog Browse
 
-    private func browseCatalog(token: String, vpcId: String, filters: [String: Any], searchString: String? = nil, maxPages: Int = 3) async throws -> [GameInfo] {
+    /// Cursor pagination is inherently serial (each page needs the previous cursor),
+    /// so page count dominates load time. Large pages cut the round trips; the
+    /// long-proven 200-item retry runs only when the oversized page is plausibly
+    /// the cause: a client-error HTTP status (except auth) or an empty result —
+    /// a GraphQL-level rejection arrives as HTTP 200 with no data. Auth, network,
+    /// and server failures propagate immediately instead of doubling the requests.
+    private func browseCatalog(
+        token: String,
+        vpcId: String,
+        filters: [String: Any],
+        searchString: String? = nil,
+        maxPages: Int = 3,
+        includeGenres: Bool = true
+    ) async throws -> [GameInfo] {
+        do {
+            do {
+                let games = try await browsePages(
+                    token: token, vpcId: vpcId, filters: filters, searchString: searchString,
+                    pageSize: 500, maxPages: maxPages, includeGenres: includeGenres
+                )
+                if !games.isEmpty {
+                    return games
+                }
+            } catch let GamesError.httpStatus(code, _) where (400 ..< 500).contains(code) && code != 403 {
+                // Fall through to the 200-item retry.
+            }
+
+            return try await browsePages(
+                token: token, vpcId: vpcId, filters: filters, searchString: searchString,
+                pageSize: 200, maxPages: maxPages, includeGenres: includeGenres
+            )
+        } catch let GamesError.graphql(message) where includeGenres && message.localizedCaseInsensitiveContains("genre") {
+            gamesLog.warning("[GamesClient] browse genres unavailable; retrying compatible query")
+            return try await browseCatalog(
+                token: token, vpcId: vpcId, filters: filters, searchString: searchString,
+                maxPages: maxPages, includeGenres: false
+            )
+        }
+    }
+
+    private func browsePages(
+        token: String,
+        vpcId: String,
+        filters: [String: Any],
+        searchString: String?,
+        pageSize: Int,
+        maxPages: Int,
+        includeGenres: Bool
+    ) async throws -> [GameInfo] {
         var allGames: [GameInfo] = []
         var seen = Set<String>()
         var cursor = ""
@@ -79,7 +146,7 @@ actor GamesClient {
                 "vpcId": vpcId,
                 "locale": localeCode,
                 "sortString": "sortName:ASC",
-                "fetchCount": 200,
+                "fetchCount": pageSize,
                 "cursor": cursor,
                 "filters": filters,
             ]
@@ -87,9 +154,9 @@ actor GamesClient {
             if let search = searchString, !search.isEmpty {
                 variables["searchString"] = search
                 variables["sortString"] = "itemMetadata.relevance:DESC,sortName:ASC"
-                query = GamesClient.searchQuery
+                query = includeGenres ? GamesClient.searchQuery : GamesClient.searchQueryWithoutGenres
             } else {
-                query = GamesClient.browseQuery
+                query = includeGenres ? GamesClient.browseQuery : GamesClient.browseQueryWithoutGenres
             }
 
             let body: [String: Any] = ["query": query, "variables": variables]
@@ -102,11 +169,23 @@ actor GamesClient {
             request.httpBody = bodyData
 
             let (data, response) = try await urlSession.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                throw GamesError.fetchFailed(String(data: data, encoding: .utf8) ?? "")
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard statusCode == 200 else {
+                if statusCode == 401 {
+                    throw GamesError.unauthorized
+                }
+                throw GamesError.httpStatus(statusCode, String(data: data, encoding: .utf8) ?? "")
             }
 
             let payload = try JSONDecoder().decode(BrowseResponse.self, from: data)
+            if let genreErrors = payload.errors?.filter({
+                $0.message.localizedCaseInsensitiveContains("genre")
+            }), !genreErrors.isEmpty {
+                throw GamesError.graphql(genreErrors.map(\.message).joined(separator: "; "))
+            }
+            if payload.data?.apps == nil {
+                try validateGraphQL(errors: payload.errors)
+            }
             guard let apps = payload.data?.apps else { break }
 
             for item in apps.items ?? [] {
@@ -120,7 +199,7 @@ actor GamesClient {
             cursor = next
         }
 
-        print("[GamesClient] browseCatalog: \(allGames.count) games fetched")
+        gamesLog.debug("[GamesClient] browseCatalog: \(allGames.count, privacy: .public) games fetched")
         return allGames
     }
 
@@ -150,10 +229,16 @@ actor GamesClient {
         return GameInfo(
             id: id,
             title: item.title ?? id,
+            longDescription: nil,
+            genres: item.genres,
+            developer: nil,
+            publisher: nil,
+            contentRating: nil,
             boxArtUrl: item.images?.GAME_BOX_ART.flatMap { optimizeImageUrl($0) },
             heroBannerUrl: (item.images?.TV_BANNER ?? item.images?.HERO_IMAGE).flatMap { optimizeImageUrl($0, width: 1920) },
             heroImageUrl: (item.images?.HERO_IMAGE ?? item.images?.TV_BANNER).flatMap { optimizeImageUrl($0, width: 1920) },
             supportedFeatures: Self.deriveFeatures(from: item.variants),
+            screenshots: [],
             isInLibrary: item.variants?.contains { $0.gfn?.library?.isOwned == true } ?? false,
             variants: variants
         )
@@ -216,6 +301,9 @@ actor GamesClient {
                 for variant in game.variants where variantIds.insert(variant.id).inserted {
                     existing.variants.append(variant)
                 }
+                if existing.genres?.isEmpty != false, let genres = game.genres, !genres.isEmpty {
+                    existing.genres = genres
+                }
                 games[index] = existing
             } else if seenIds.insert(game.id).inserted {
                 indexByTitle[titleKey] = games.count
@@ -271,10 +359,16 @@ actor GamesClient {
         return GameInfo(
             id: id,
             title: title,
+            longDescription: nil,
+            genres: stringArray(entry["genres"] ?? entry["genre"]),
+            developer: nil,
+            publisher: nil,
+            contentRating: nil,
             boxArtUrl: boxArt.flatMap { optimizeImageUrl($0) },
             heroBannerUrl: hero.flatMap { optimizeImageUrl($0, width: 1920) },
             heroImageUrl: heroImage.flatMap { optimizeImageUrl($0, width: 1920) },
             supportedFeatures: nil,
+            screenshots: [],
             isInLibrary: false,
             variants: variants
         )
@@ -335,13 +429,24 @@ actor GamesClient {
             let boxArt = meta.images?.GAME_BOX_ART.flatMap { optimizeImageUrl($0) }
             let hero = (meta.images?.TV_BANNER ?? meta.images?.HERO_IMAGE).flatMap { optimizeImageUrl($0, width: 1920) }
             let heroImage = (meta.images?.HERO_IMAGE ?? meta.images?.TV_BANNER).flatMap { optimizeImageUrl($0, width: 1920) }
+            let shots = (meta.images?.screenshots ?? []).compactMap { optimizeImageUrl($0, width: 640) }
+            let rating: String? = {
+                guard let t = meta.contentRatings?.type, let k = meta.contentRatings?.categoryKey else { return game.contentRating }
+                return "\(t) \(k)"
+            }()
             return GameInfo(
                 id: game.id,
                 title: meta.title ?? game.title,
+                longDescription: meta.longDescription ?? game.longDescription,
+                genres: meta.genres ?? game.genres,
+                developer: meta.developerName ?? game.developer,
+                publisher: meta.publisherName ?? game.publisher,
+                contentRating: rating,
                 boxArtUrl: boxArt ?? game.boxArtUrl,
                 heroBannerUrl: hero ?? game.heroBannerUrl,
                 heroImageUrl: heroImage ?? game.heroImageUrl,
                 supportedFeatures: game.supportedFeatures,
+                screenshots: shots.isEmpty ? game.screenshots : shots,
                 isInLibrary: game.isInLibrary,
                 variants: game.variants
             )
@@ -378,7 +483,7 @@ actor GamesClient {
                 throw GamesError.unauthorized
             } catch {
                 failedChunkCount += 1
-                print("[Games] metadata chunk failed for \(chunk.count) apps: \(error)")
+                gamesLog.warning("[Games] metadata chunk failed for \(chunk.count, privacy: .public) apps: \(error, privacy: .private)")
             }
         }
         return MetadataFetchResult(failedChunkCount: failedChunkCount)
@@ -518,6 +623,52 @@ actor GamesClient {
         return payload.requestStatus?.serverId ?? "GFN-PC"
     }
 
+    private func appToGame(_ app: AppData) -> GameInfo? {
+        guard let rawId = app.id else { return nil }
+        let id = rawId.stringValue
+        let selectedVariantId = app.variants?.first(where: { $0.gfn?.library?.selected == true })?.id
+        var variants: [GameVariant] = app.variants?.compactMap { v in
+            guard let vid = v.id else { return nil }
+            let appStore = (v.appStore ?? "unknown").trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedStore = appStore.lowercased()
+            guard !appStore.isEmpty, normalizedStore != "unknown", normalizedStore != "none" else {
+                return nil
+            }
+            return GameVariant(id: vid, appStore: appStore, appId: isNumericId(vid) ? vid : nil)
+        } ?? []
+
+        // Move the backend-selected variant to front so variants.first is the default launch store
+        if let selectedVariantId,
+           let selectedIndex = variants.firstIndex(where: { $0.id == selectedVariantId }),
+           selectedIndex > 0
+        {
+            let selected = variants.remove(at: selectedIndex)
+            variants.insert(selected, at: 0)
+        }
+
+        let rating: String? = {
+            guard let t = app.contentRatings?.type, let k = app.contentRatings?.categoryKey else { return nil }
+            return "\(t) \(k)"
+        }()
+        let shots = (app.images?.screenshots ?? []).compactMap { optimizeImageUrl($0, width: 640) }
+        return GameInfo(
+            id: id,
+            title: app.title ?? id,
+            longDescription: app.longDescription,
+            genres: app.genres,
+            developer: app.developerName,
+            publisher: app.publisherName,
+            contentRating: rating,
+            boxArtUrl: app.images?.GAME_BOX_ART.flatMap { optimizeImageUrl($0) },
+            heroBannerUrl: (app.images?.TV_BANNER ?? app.images?.HERO_IMAGE).flatMap { optimizeImageUrl($0, width: 1920) },
+            heroImageUrl: (app.images?.HERO_IMAGE ?? app.images?.TV_BANNER).flatMap { optimizeImageUrl($0, width: 1920) },
+            supportedFeatures: nil,
+            screenshots: shots,
+            isInLibrary: app.variants?.contains { $0.gfn?.library?.selected == true } ?? false,
+            variants: variants
+        )
+    }
+
     // MARK: - Helpers
 
     private func optimizeImageUrl(_ url: String, width: Int = 272) -> String? {
@@ -568,6 +719,21 @@ actor GamesClient {
         }
         if let number = value as? NSNumber {
             return number.stringValue
+        }
+        return nil
+    }
+
+    private func stringArray(_ value: Any?) -> [String]? {
+        if let strings = value as? [String] {
+            let cleaned = strings.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+            return cleaned.isEmpty ? nil : cleaned
+        }
+        if let string = value as? String {
+            let cleaned = string
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            return cleaned.isEmpty ? nil : cleaned
         }
         return nil
     }
@@ -644,6 +810,7 @@ private struct BrowseResponse: Decodable {
         struct BrowseApp: Decodable {
             let id: AnyCodableGameId?
             let title: String?
+            let genres: [String]?
             let images: Images?
             let variants: [Variant]?
 
@@ -718,13 +885,48 @@ private struct PageInfo: Decodable {
 private struct AppData: Decodable {
     let id: AnyCodableGameId?
     let title: String?
+    let longDescription: String?
+    let genres: [String]?
+    let developerName: String?
+    let publisherName: String?
+    let contentRatings: ContentRating?
     let images: Images?
     let variants: [Variant]?
+
+    struct ContentRating: Decodable {
+        let type: String?
+        let categoryKey: String?
+    }
 
     struct Images: Decodable {
         let GAME_BOX_ART: String?
         let TV_BANNER: String?
         let HERO_IMAGE: String?
+        let screenshots: [String]
+
+        private struct AnyKey: CodingKey {
+            var stringValue: String
+            var intValue: Int?
+            init?(stringValue: String) {
+                self.stringValue = stringValue
+            }
+
+            init?(intValue _: Int) {
+                nil
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: AnyKey.self)
+            GAME_BOX_ART = try c.decodeIfPresent(String.self, forKey: AnyKey(stringValue: "GAME_BOX_ART")!)
+            TV_BANNER = try c.decodeIfPresent(String.self, forKey: AnyKey(stringValue: "TV_BANNER")!)
+            HERO_IMAGE = try c.decodeIfPresent(String.self, forKey: AnyKey(stringValue: "HERO_IMAGE")!)
+            screenshots = c.allKeys
+                .filter { $0.stringValue.hasPrefix("SCREENSHOT") }
+                .sorted { $0.stringValue < $1.stringValue }
+                .compactMap { try? c.decode(String.self, forKey: $0) }
+                .filter { !$0.isEmpty }
+        }
     }
 
     struct Variant: Decodable {
@@ -762,6 +964,7 @@ private struct AnyCodableGameId: Decodable {
 
 enum GamesError: Error, LocalizedError {
     case fetchFailed(String)
+    case httpStatus(Int, String)
     case graphql(String)
     case pagination(String)
     case unauthorized
@@ -769,6 +972,7 @@ enum GamesError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .fetchFailed(message): "Games fetch failed: \(message)"
+        case let .httpStatus(code, message): "Games fetch failed: HTTP \(code): \(message)"
         case let .graphql(message): "Games GraphQL error: \(message)"
         case let .pagination(message): "Games pagination failed: \(message)"
         case .unauthorized: "Games authentication was rejected."

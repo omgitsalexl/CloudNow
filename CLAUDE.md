@@ -8,9 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Git
 
-- **Upstream**: `origin` → `owenselles/CloudNow` (original author)
-- **Fork**: `fork` → `yowmamasita/CloudNow` (our fork — push here)
-- `project.pbxproj` contains our dev team ID (`7RX5G7H8DW`) and deployment target (`18.0`) — don't commit this to branches intended for upstream PRs
+- `origin` → `owenselles/CloudNow`
+- Push feature branches to `origin` and open PRs against `main`
 
 ## Building
 
@@ -82,6 +81,11 @@ All source lives in `CloudNow/`. Five functional areas:
 - `SettingsView.swift` — Stream quality (resolution, FPS, codec, color, keyboard layout, game language, L4S), controller deadzone slider, zone picker, microphone toggle, account info.
 - `QueueAdPlayerView.swift` — AVPlayer-based queue ad playback; reports lifecycle events to CloudMatch.
 - `LoginView.swift` — Displays a QR code and PIN for NVIDIA device flow login; user scans the QR code or visits the URL on any device to complete OAuth.
+
+## Agent Rules
+
+- **Language**: All code, comments, commit messages, PR titles, and PR descriptions must be written in **English US**.
+- **Commits and PRs**: Do not add `Co-Authored-By: Claude` lines to commits. Do not add "🤖 Generated with Claude Code" footers to PR descriptions.
 
 ## Key Patterns
 
