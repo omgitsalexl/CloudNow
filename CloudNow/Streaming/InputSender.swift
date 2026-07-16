@@ -83,7 +83,7 @@ enum InputSendDisposition {
     case superseded
 }
 
-enum SubmittedTextValidationResult: Sendable {
+enum SubmittedTextValidationResult {
     case supported
     case unsupportedCharacters
 }
@@ -480,7 +480,7 @@ final class InputSender {
         let button: GCControllerButtonInput
     }
 
-    private struct KeyboardReplayEvent: Sendable {
+    private struct KeyboardReplayEvent {
         let down: Bool
         let vk: UInt16
         let scancode: UInt16
