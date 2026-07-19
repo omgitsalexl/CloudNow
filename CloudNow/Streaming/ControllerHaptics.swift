@@ -1,11 +1,11 @@
-import CoreHaptics
+@preconcurrency import CoreHaptics
 import Foundation
-import GameController
+@preconcurrency import GameController
 import os.log
 
-private let hapticsLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Haptics")
+private nonisolated let hapticsLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Haptics")
 
-final nonisolated class ControllerHaptics {
+final nonisolated class ControllerHaptics: @unchecked Sendable {
     private final class Motor: @unchecked Sendable {
         let locality: GCHapticsLocality
         var engine: CHHapticEngine?
@@ -32,20 +32,23 @@ final nonisolated class ControllerHaptics {
     private let strongMotor: Motor?
     private let weakMotor: Motor?
 
-    /// User-controlled rumble power (mirrors StreamSettings.rumbleIntensity). Mutate on `queue`.
-    var intensityScale: Float = 1.0
+    /// User-controlled rumble power (mirrors StreamSettings.rumbleIntensity).
+    private var intensityScale: Float = 1.0
 
     /// Perceptual gamma applied to raw magnitudes; <1 boosts subtle low-end rumble.
     private static let intensityCurveExponent: Float = 0.5
 
-    init?(controller: GCController, queue: DispatchQueue) {
+    init?(controller: GCController) {
         guard let haptics = controller.haptics else {
             hapticsLog.warning("[Rumble] controller has NO haptics")
             return nil
         }
         hapticsLog.debug("[Rumble] haptics localities=\(String(describing: haptics.supportedLocalities.map(\.rawValue)), privacy: .public)")
 
-        self.queue = queue
+        queue = DispatchQueue(
+            label: "com.cloudnow.controller-haptics.\(ObjectIdentifier(controller).hashValue)",
+            qos: .userInteractive
+        )
         strongMotor = Self.makeMotor(
             locality: GCHapticsLocality.leftHandle,
             haptics: haptics
@@ -67,26 +70,37 @@ final nonisolated class ControllerHaptics {
         }
     }
 
-    /// Must be called on `queue`.
     func setMotors(strong: UInt16, weak: UInt16) {
-        if let strongMotor {
-            apply(strong, to: strongMotor)
-        }
-        if let weakMotor {
-            apply(weak, to: weakMotor)
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let strongMotor {
+                apply(strong, to: strongMotor)
+            }
+            if let weakMotor {
+                apply(weak, to: weakMotor)
+            }
         }
     }
 
-    /// On `queue`.
+    func setIntensityScale(_ scale: Float) {
+        queue.async { [weak self] in
+            self?.intensityScale = scale
+        }
+    }
+
     func stop() {
-        stop(strongMotor)
-        stop(weakMotor)
+        queue.async { [weak self] in
+            guard let self else { return }
+            stop(strongMotor)
+            stop(weakMotor)
+        }
     }
 
-    /// On `queue`.
     func cleanup() {
-        cleanup(strongMotor)
-        cleanup(weakMotor)
+        queue.async { [self] in
+            cleanup(strongMotor)
+            cleanup(weakMotor)
+        }
     }
 
     private static func makeMotor(
@@ -112,19 +126,21 @@ final nonisolated class ControllerHaptics {
 
     private func setHandlers(for motor: Motor) {
         motor.engine?.stoppedHandler = { [weak self, weak motor] _ in
-            self?.queue.async {
-                motor?.player = nil
-                motor?.playing = false
+            guard let self, let motor else { return }
+            queue.async { [motor] in
+                motor.player = nil
+                motor.playing = false
             }
         }
         motor.engine?.resetHandler = { [weak self, weak motor] in
-            self?.queue.async {
-                motor?.player = nil
-                motor?.playing = false
+            guard let self, let motor else { return }
+            queue.async { [motor] in
+                motor.player = nil
+                motor.playing = false
                 do {
-                    try motor?.engine?.start()
+                    try motor.engine?.start()
                 } catch {
-                    motor?.log(error)
+                    motor.log(error)
                 }
             }
         }

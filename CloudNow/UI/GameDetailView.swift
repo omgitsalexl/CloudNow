@@ -13,18 +13,25 @@ struct GameDetailView: View {
     let onPlay: (GameInfo) -> Void
     var presentationStyle: ExpandedDetailPresentationStyle = .fullScreen
     var onCollapse: (() -> Void)?
+    var rendersBackground = true
 
     @Environment(GamesViewModel.self) var viewModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showFullDescription = false
     @State private var showFullDetails = false
-    @FocusState private var heroFocused: Bool
-    @FocusState private var aboutFocused: Bool
-    @FocusState private var detailsFocused: Bool
+    @FocusState private var focusedElement: DetailFocus?
     @State private var backgroundBlurred = false
     @State private var appeared = false
     @State private var dismissing = false
-    @FocusState private var carouselExitCatcherFocused: Bool
+
+    private enum DetailFocus: Hashable {
+        case play
+        case favorite
+        case about
+        case details
+        case exitCatcher
+    }
 
     private var isEmbeddedCarousel: Bool {
         presentationStyle == .embeddedCarousel
@@ -32,6 +39,19 @@ struct GameDetailView: View {
 
     private var isCarouselExpanded: Bool {
         presentationStyle == .carouselExpanded
+    }
+
+    private var preferredFocusTarget: DetailFocus {
+        if game.isInLibrary {
+            return .play
+        }
+        if let description = game.longDescription, !description.isEmpty {
+            return .about
+        }
+        if !detailItems.isEmpty {
+            return .details
+        }
+        return .exitCatcher
     }
 
     private var detailItems: [(String, String)] {
@@ -58,46 +78,31 @@ struct GameDetailView: View {
     private var fullScreenBody: some View {
         ZStack {
             GameDetailBackground(game: game, blurred: backgroundBlurred)
+            exitFocusCatcher(action: dismissFullScreen)
 
             ScrollViewReader { proxy in
                 detailScrollContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea()
-                    .onChange(of: heroFocused) { _, focused in
-                        if focused {
-                            backgroundBlurred = false
-                            withAnimation(.smooth) { proxy.scrollTo("hero", anchor: .top) }
-                        }
-                    }
-                    .onChange(of: aboutFocused) { _, focused in
-                        if focused {
-                            backgroundBlurred = true
-                            withAnimation(.smooth) { proxy.scrollTo("detail", anchor: .top) }
-                        }
-                    }
-                    .onChange(of: detailsFocused) { _, focused in
-                        if focused {
-                            backgroundBlurred = true
-                            withAnimation(.smooth) { proxy.scrollTo("detail", anchor: .top) }
-                        }
+                    .onChange(of: focusedElement) { _, focus in
+                        handleFocusChange(focus, proxy: proxy)
                     }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .opacity(appeared && !dismissing ? 1 : 0)
             .offset(y: appeared && !dismissing ? 0 : 40)
-            .animation(.easeOut(duration: 0.4), value: appeared)
-            .animation(.easeIn(duration: 0.28), value: dismissing)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.4), value: appeared)
+            .animation(reduceMotion ? nil : .easeIn(duration: 0.28), value: dismissing)
         }
         .ignoresSafeArea()
         .onAppear {
-            withAnimation { appeared = true }
-        }
-        .onExitCommand {
-            withAnimation { dismissing = true }
-            Task {
-                try? await Task.sleep(for: .milliseconds(280))
-                dismiss()
+            withAnimation(reduceMotion ? nil : .default) {
+                appeared = true
             }
+        }
+        .defaultFocus($focusedElement, preferredFocusTarget)
+        .onExitCommand {
+            dismissFullScreen()
         }
         .fullScreenCover(isPresented: $showFullDescription) {
             if let desc = game.longDescription {
@@ -111,7 +116,9 @@ struct GameDetailView: View {
 
     private var embeddedBody: some View {
         ZStack {
-            GameDetailBackground(game: game, blurred: false)
+            if rendersBackground {
+                GameDetailBackground(game: game, blurred: false)
+            }
 
             detailScrollContent
                 .scrollDisabled(true)
@@ -128,47 +135,19 @@ struct GameDetailView: View {
             // a focused descendant on tvOS, so onExitCommand below always fires
             // (Menu/back), regardless of whether the hero buttons exist or are
             // laid out yet.
-            Button(action: { onCollapse?() }, label: {
-                Color.clear.frame(width: 1, height: 1)
-            })
-            .buttonStyle(.plain)
-            .focused($carouselExitCatcherFocused)
-            .focusEffectDisabled()
-            .opacity(0.001)
-            .accessibilityHidden(true)
+            exitFocusCatcher { onCollapse?() }
 
             ScrollViewReader { proxy in
                 detailScrollContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea()
-                    .onChange(of: heroFocused) { _, focused in
-                        if focused {
-                            backgroundBlurred = false
-                            withAnimation(.smooth) { proxy.scrollTo("hero", anchor: .top) }
-                        }
-                    }
-                    .onChange(of: aboutFocused) { _, focused in
-                        if focused {
-                            backgroundBlurred = true
-                            withAnimation(.smooth) { proxy.scrollTo("detail", anchor: .top) }
-                        }
-                    }
-                    .onChange(of: detailsFocused) { _, focused in
-                        if focused {
-                            backgroundBlurred = true
-                            withAnimation(.smooth) { proxy.scrollTo("detail", anchor: .top) }
-                        }
+                    .onChange(of: focusedElement) { _, focus in
+                        handleFocusChange(focus, proxy: proxy)
                     }
             }
         }
         .ignoresSafeArea()
-        .onAppear {
-            carouselExitCatcherFocused = true
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(50))
-                heroFocused = true
-            }
-        }
+        .defaultFocus($focusedElement, preferredFocusTarget)
         .onExitCommand {
             onCollapse?()
         }
@@ -179,6 +158,47 @@ struct GameDetailView: View {
         }
         .fullScreenCover(isPresented: $showFullDetails) {
             FullDetailsView(title: game.title, items: detailItems)
+        }
+    }
+
+    private func exitFocusCatcher(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Color.clear.frame(width: 1, height: 1)
+        }
+        .buttonStyle(.plain)
+        .focused($focusedElement, equals: .exitCatcher)
+        .focusEffectDisabled()
+        .opacity(0.001)
+        .accessibilityHidden(true)
+    }
+
+    private func handleFocusChange(_ focus: DetailFocus?, proxy: ScrollViewProxy) {
+        switch focus {
+        case .play, .favorite:
+            backgroundBlurred = false
+            withAnimation(reduceMotion ? nil : .smooth) {
+                proxy.scrollTo("hero", anchor: .top)
+            }
+        case .about, .details:
+            backgroundBlurred = true
+            withAnimation(reduceMotion ? nil : .smooth) {
+                proxy.scrollTo("detail", anchor: .top)
+            }
+        case .exitCatcher, nil:
+            break
+        }
+    }
+
+    private func dismissFullScreen() {
+        guard !dismissing else { return }
+        if reduceMotion {
+            dismiss()
+            return
+        }
+        withAnimation { dismissing = true }
+        Task {
+            try? await Task.sleep(for: .milliseconds(280))
+            dismiss()
         }
     }
 
@@ -195,7 +215,10 @@ struct GameDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .opacity(backgroundBlurred ? 1 : 0)
                         .offset(y: backgroundBlurred ? 0 : 30)
-                        .animation(.easeOut(duration: 0.35).delay(0.1), value: backgroundBlurred)
+                        .animation(
+                            reduceMotion ? nil : .easeOut(duration: 0.35).delay(0.1),
+                            value: backgroundBlurred
+                        )
 
                     if !game.screenshots.isEmpty {
                         screenshotsRow
@@ -259,7 +282,7 @@ struct GameDetailView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(.green)
-                            .focused($heroFocused)
+                            .focused($focusedElement, equals: .play)
 
                             let isFav = viewModel.favoriteIds.contains(game.id)
                             Button {
@@ -271,7 +294,7 @@ struct GameDetailView: View {
                                 )
                             }
                             .buttonStyle(.bordered)
-                            .focused($heroFocused)
+                            .focused($focusedElement, equals: .favorite)
                         }
                         .allowsHitTesting(!isEmbeddedCarousel)
                     }
@@ -291,17 +314,17 @@ struct GameDetailView: View {
 
     private var screenshotsRow: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Screenshots").font(.title3.weight(.semibold))
+            Text("Screenshots")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 16) {
+                LazyHStack(spacing: 16) {
                     ForEach(Array(game.screenshots.enumerated()), id: \.offset) { _, url in
                         Button {} label: {
-                            AsyncImage(url: URL(string: url)) { phase in
-                                switch phase {
-                                case let .success(image): image.resizable().aspectRatio(contentMode: .fill)
-                                default: Color.gray.opacity(0.3)
-                                }
-                            }
+                            SharedArtworkImage(
+                                urlString: url,
+                                maxPixelSize: ArtworkImagePipeline.screenshotPixelSize
+                            )
                             .frame(width: 426, height: 240)
                             .clipShape(RoundedRectangle(cornerRadius: 12))
                         }
@@ -322,7 +345,9 @@ struct GameDetailView: View {
         if !detailItems.isEmpty {
             HStack(alignment: .top, spacing: 20) {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Details").font(.title3.weight(.semibold))
+                    Text("Details")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(.white)
 
                     Button {
                         showFullDetails = true
@@ -332,11 +357,11 @@ struct GameDetailView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(label.uppercased())
                                         .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.white.opacity(0.55))
                                         .kerning(1)
                                     Text(value)
                                         .font(.callout)
-                                        .foregroundStyle(.primary)
+                                        .foregroundStyle(.white.opacity(0.9))
                                         .fixedSize(horizontal: false, vertical: true)
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -345,6 +370,7 @@ struct GameDetailView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .buttonStyle(PassthroughButtonStyle())
+                    .focused($focusedElement, equals: .details)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -358,7 +384,9 @@ struct GameDetailView: View {
 
     private func aboutPanel(_ desc: String) -> some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("About").font(.title3.weight(.semibold))
+            Text("About")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
             Button {
                 showFullDescription = true
             } label: {
@@ -375,7 +403,7 @@ struct GameDetailView: View {
                 .frame(maxWidth: 600, alignment: .leading)
             }
             .buttonStyle(.card)
-            .focused($aboutFocused)
+            .focused($focusedElement, equals: .about)
         }
     }
 
@@ -410,7 +438,9 @@ struct GameDetailView: View {
                 rightInfo("Rating", rating)
             }
             if game.variants.count > 1, game.isInLibrary {
-                Divider().frame(width: 200).opacity(0.3)
+                Divider()
+                    .overlay(Color.white.opacity(0.35))
+                    .frame(width: 200)
                 variantPicker
             }
         }
@@ -418,14 +448,23 @@ struct GameDetailView: View {
 
     private func rightInfo(_ label: String, _ value: String) -> some View {
         VStack(alignment: .trailing, spacing: 2) {
-            Text(label.uppercased()).font(.caption2.weight(.semibold)).foregroundStyle(.secondary).kerning(1)
-            Text(value).font(.callout).foregroundStyle(.white.opacity(0.8)).multilineTextAlignment(.trailing)
+            Text(label.uppercased())
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.6))
+                .kerning(1)
+            Text(value)
+                .font(.callout)
+                .foregroundStyle(.white.opacity(0.9))
+                .multilineTextAlignment(.trailing)
         }
     }
 
     private var variantPicker: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            Text("LAUNCH VIA").font(.caption2.weight(.semibold)).foregroundStyle(.secondary).kerning(1)
+            Text("LAUNCH VIA")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.6))
+                .kerning(1)
             ForEach(game.variants, id: \.id) { variant in
                 let isSelected = viewModel.preferredVariantId(for: game) == variant.id
                 Button {
@@ -453,17 +492,26 @@ struct GameDetailBackground: View {
 
     var body: some View {
         ZStack {
-            AsyncImage(url: game.heroBannerUrl.flatMap(URL.init) ?? game.boxArtUrl.flatMap(URL.init)) { phase in
-                switch phase {
-                case let .success(image): image.resizable().aspectRatio(contentMode: .fill)
-                default: Color.black
-                }
-            }
+            SharedArtworkImage(
+                urlString: game.heroBannerUrl.flatMap(URL.init) == nil
+                    ? game.boxArtUrl
+                    : game.heroBannerUrl,
+                maxPixelSize: ArtworkImagePipeline.heroArtPixelSize
+            )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .clipped()
             .blur(radius: blurred ? 20 : 0)
             .animation(.easeInOut(duration: 0.4), value: blurred)
 
+            GameDetailArtworkScrim()
+        }
+        .ignoresSafeArea()
+    }
+}
+
+struct GameDetailArtworkScrim: View {
+    var body: some View {
+        ZStack {
             LinearGradient(
                 stops: [
                     .init(color: .black.opacity(0.92), location: 0),
@@ -473,9 +521,18 @@ struct GameDetailBackground: View {
                 startPoint: .bottomLeading,
                 endPoint: .topTrailing
             )
-            .allowsHitTesting(false)
+
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.55),
+                    .init(color: .black.opacity(0.2), location: 0.72),
+                    .init(color: .black.opacity(0.74), location: 1),
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
         }
-        .ignoresSafeArea()
+        .allowsHitTesting(false)
     }
 }
 
@@ -550,7 +607,7 @@ struct FullDetailsView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(label.uppercased())
                                     .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.white.opacity(0.55))
                                     .kerning(1)
                                 Text(value)
                                     .font(.body)

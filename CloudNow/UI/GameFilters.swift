@@ -112,41 +112,15 @@ enum GameFilterEngine {
         favoriteIds: Set<String>,
         recentlyPlayedIds: [String]
     ) -> [GameInfo] {
-        var result = games
-
         let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !search.isEmpty {
-            result = result.filter { $0.title.localizedCaseInsensitiveContains(search) }
-        }
-
-        if !state.collections.isEmpty {
-            result = result.filter { game in
-                (state.collections.contains(.library) && game.isInLibrary)
-                    || (state.collections.contains(.favorites) && favoriteIds.contains(game.id))
-            }
-        }
-
-        if !state.genres.isEmpty {
-            result = result.filter { !state.genres.isDisjoint(with: $0.genreCodes) }
-        }
-
-        if !state.stores.isEmpty {
-            result = result.filter { game in
-                let gameStores: [String] = switch context {
-                case .store:
-                    game.variants.map(\.appStore)
-                case .library:
-                    game.ownedStores
-                }
-                let normalizedStores = Set(gameStores.map(GameStoreFilter.normalizedCode))
-                return !state.stores.isDisjoint(with: normalizedStores)
-            }
-        }
-
-        if !state.features.isEmpty {
-            result = result.filter { game in
-                !state.features.isDisjoint(with: game.supportedFeatures ?? [])
-            }
+        var result = games.filter { game in
+            matches(
+                game,
+                context: context,
+                state: state,
+                search: search,
+                favoriteIds: favoriteIds
+            )
         }
 
         switch sortOrder {
@@ -172,6 +146,75 @@ enum GameFilterEngine {
         }
 
         return result
+    }
+
+    static func count(
+        in games: [GameInfo],
+        context: GameFilterContext,
+        state: GameFilterState,
+        searchText: String,
+        favoriteIds: Set<String>
+    ) -> Int {
+        let search = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        return games.count { game in
+            matches(
+                game,
+                context: context,
+                state: state,
+                search: search,
+                favoriteIds: favoriteIds
+            )
+        }
+    }
+
+    private static func matches(
+        _ game: GameInfo,
+        context: GameFilterContext,
+        state: GameFilterState,
+        search: String,
+        favoriteIds: Set<String>
+    ) -> Bool {
+        if !search.isEmpty,
+           !game.title.localizedCaseInsensitiveContains(search)
+        {
+            return false
+        }
+
+        if !state.collections.isEmpty {
+            let matchesCollection =
+                (state.collections.contains(.library) && game.isInLibrary)
+                    || (state.collections.contains(.favorites) && favoriteIds.contains(game.id))
+            if !matchesCollection {
+                return false
+            }
+        }
+
+        if !state.genres.isEmpty,
+           state.genres.isDisjoint(with: game.genreCodes)
+        {
+            return false
+        }
+
+        if !state.stores.isEmpty {
+            let gameStores: [String] = switch context {
+            case .store:
+                game.variants.map(\.appStore)
+            case .library:
+                game.ownedStores
+            }
+            let normalizedStores = Set(gameStores.map(GameStoreFilter.normalizedCode))
+            if state.stores.isDisjoint(with: normalizedStores) {
+                return false
+            }
+        }
+
+        if !state.features.isEmpty,
+           state.features.isDisjoint(with: game.supportedFeatures ?? [])
+        {
+            return false
+        }
+
+        return true
     }
 }
 
@@ -206,6 +249,7 @@ struct GameFilterBar: View {
     let context: GameFilterContext
     let options: GameFilterOptions
     let availableSortOrders: [LibrarySortOrder]
+    let previewBaseCount: Int
     let previewCount: (GameFilterState) -> Int
 
     @Binding var filterState: GameFilterState
@@ -266,11 +310,13 @@ struct GameFilterBar: View {
         }
         .padding(.horizontal, 60)
         .padding(.vertical, 22)
+        .focusSection()
         .fullScreenCover(isPresented: $isShowingFilters) {
             GameFilterSheet(
                 state: $filterState,
                 context: context,
                 options: options,
+                totalCount: previewBaseCount,
                 previewCount: previewCount,
                 onClose: { isShowingFilters = false }
             )
@@ -428,8 +474,11 @@ private struct WrappingFilterLayout: Layout {
 private struct GameFilterSheet: View {
     @Binding var state: GameFilterState
 
+    @Environment(\.colorScheme) private var colorScheme
+
     let context: GameFilterContext
     let options: GameFilterOptions
+    let totalCount: Int
     let previewCount: (GameFilterState) -> Int
     let onClose: () -> Void
 
@@ -443,7 +492,7 @@ private struct GameFilterSheet: View {
     var body: some View {
         ZStack {
             LinearGradient(
-                colors: [Color(white: 0.055), Color(white: 0.11)],
+                colors: sheetBackgroundColors,
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
             )
@@ -495,11 +544,19 @@ private struct GameFilterSheet: View {
             }
         }
         .onExitCommand(perform: onClose)
+        .blocksGlobalControllerNavigation()
+    }
+
+    private var sheetBackgroundColors: [Color] {
+        if colorScheme == .dark {
+            [Color(white: 0.055), Color(white: 0.11)]
+        } else {
+            [Color(white: 0.98), Color(white: 0.9)]
+        }
     }
 
     private var header: some View {
         let resultCount = previewCount(state)
-        let totalCount = previewCount(GameFilterState())
 
         return HStack(spacing: 20) {
             Image(systemName: "line.3.horizontal.decrease.circle.fill")
@@ -538,7 +595,7 @@ private struct GameFilterSheet: View {
         }
         .padding(.horizontal, 70)
         .padding(.vertical, 18)
-        .background(Color.black.opacity(0.38))
+        .background(Color.black.opacity(colorScheme == .dark ? 0.38 : 0.04))
         .overlay(alignment: .bottom) { Divider().opacity(0.6) }
     }
 
@@ -661,6 +718,8 @@ private struct FilterAccordionSection<Content: View>: View {
     @Binding var isExpanded: Bool
     @ViewBuilder let content: Content
 
+    @Environment(\.colorScheme) private var colorScheme
+
     var body: some View {
         VStack(spacing: 12) {
             Button {
@@ -685,7 +744,10 @@ private struct FilterAccordionSection<Content: View>: View {
                 }
                 .padding(.horizontal, 20)
                 .frame(height: 58)
-                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+                .background(
+                    Color.primary.opacity(colorScheme == .dark ? 0.06 : 0.07),
+                    in: RoundedRectangle(cornerRadius: 12)
+                )
             }
             .buttonStyle(.plain)
 
@@ -702,6 +764,8 @@ private struct FilterOptionButton: View {
     let count: Int
     let isSelected: Bool
     let action: () -> Void
+
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         Button(action: action) {
@@ -720,12 +784,19 @@ private struct FilterOptionButton: View {
             .padding(.horizontal, 15)
             .frame(minHeight: 54)
             .background(
-                isSelected ? Color.green.opacity(0.14) : Color.white.opacity(0.045),
+                isSelected
+                    ? Color.green.opacity(0.14)
+                    : Color.primary.opacity(colorScheme == .dark ? 0.045 : 0.06),
                 in: RoundedRectangle(cornerRadius: 12)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(isSelected ? Color.green.opacity(0.8) : Color.white.opacity(0.12), lineWidth: 1)
+                    .stroke(
+                        isSelected
+                            ? Color.green.opacity(0.8)
+                            : Color.primary.opacity(colorScheme == .dark ? 0.12 : 0.16),
+                        lineWidth: 1
+                    )
             }
         }
         .buttonStyle(.card)

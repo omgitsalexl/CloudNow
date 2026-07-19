@@ -21,7 +21,7 @@ struct ResumableSession {
     }
 }
 
-struct LastSessionRecord: Codable {
+nonisolated struct LastSessionRecord: Codable {
     let sessionId: String
     let serverIp: String
     let appId: String
@@ -68,32 +68,118 @@ struct LastSessionRecord: Codable {
     }
 }
 
+enum DatasetLoadPhase: Equatable {
+    case idle
+    case loading
+    case loaded
+    case failed(String)
+}
+
 @Observable
 @MainActor
 class GamesViewModel {
-    var mainGames: [GameInfo] = []
-    var libraryGames: [GameInfo] = []
+    var mainGames: [GameInfo] = [] {
+        didSet { rebuildStoreDerivations() }
+    }
+
+    var libraryGames: [GameInfo] = [] {
+        didSet { rebuildLibraryDerivations() }
+    }
+
     var activeSessions: [ActiveSessionInfo] = []
-    var isLoading = false
-    var isLibraryLoading = false
-    var error: String?
-    var libraryError: String?
+    private(set) var catalogLoadPhase: DatasetLoadPhase = .loading
+    private(set) var libraryLoadPhase: DatasetLoadPhase = .loading
     var libraryWarning: String?
 
-    var favoriteIds: Set<String> = []
+    var isLoading: Bool {
+        mainGames.isEmpty && catalogLoadPhase == .loading
+    }
+
+    var isLibraryLoading: Bool {
+        libraryLoadPhase == .loading
+    }
+
+    var error: String? {
+        guard case let .failed(message) = catalogLoadPhase else { return nil }
+        return message
+    }
+
+    var libraryError: String? {
+        guard case let .failed(message) = libraryLoadPhase else { return nil }
+        return message
+    }
+
+    var favoriteIds: Set<String> = [] {
+        didSet {
+            rebuildLibraryDerivations()
+            rebuildStoreDerivations()
+        }
+    }
+
     var preferredStoreIds: [String: String] = [:]
-    var recentlyPlayedIds: [String] = []
+    var recentlyPlayedIds: [String] = [] {
+        didSet {
+            rebuildFilteredLibraryGames()
+            rebuildFilteredStoreGames()
+        }
+    }
+
     var streamSettings: StreamSettings = .init()
     var subscription: SubscriptionInfo?
     /// Session the user left without ending — available to resume for ~2 minutes.
     var resumableSession: ResumableSession?
     /// Last created session, persisted so we can resume/stop it across app launches.
     var lastSession: LastSessionRecord?
-    /// Top 5 lowest-latency zones, populated on launch.
-    var topZones: [GFNZone] = []
+    var librarySearchText = "" {
+        didSet {
+            rebuildLibraryFilterBaseCount()
+            rebuildFilteredLibraryGames()
+        }
+    }
+
+    var librarySortOrder: LibrarySortOrder = .default {
+        didSet { rebuildFilteredLibraryGames() }
+    }
+
+    var libraryFilterState = GameFilterState() {
+        didSet { rebuildFilteredLibraryGames() }
+    }
+
+    var storeSearchText = "" {
+        didSet {
+            rebuildStoreFilterBaseCount()
+            rebuildFilteredStoreGames()
+        }
+    }
+
+    var storeSortOrder: LibrarySortOrder = .default {
+        didSet { rebuildFilteredStoreGames() }
+    }
+
+    var storeFilterState = GameFilterState() {
+        didSet { rebuildFilteredStoreGames() }
+    }
+
+    private(set) var libraryFilterOptions = GameFilterOptions(
+        games: [], favoriteIds: [], context: .library
+    )
+    private(set) var filteredLibraryGames: [GameInfo] = []
+    private(set) var libraryFilterBaseCount = 0
+    private(set) var storeFilterOptions = GameFilterOptions(
+        games: [], favoriteIds: [], context: .store
+    )
+    private(set) var filteredStoreGames: [GameInfo] = []
+    private(set) var storeFilterBaseCount = 0
 
     private let gamesClient = GamesClient()
     private let cloudMatchClient = CloudMatchClient()
+    private let persistence = AppPersistenceStore.shared
+    private var currentVpcId: String?
+    private var activeSessionsTask: Task<[ActiveSessionInfo], Never>?
+    private var vpcIdRefreshTask: Task<String?, Never>?
+    private var latestNetworkLibraryGames: [GameInfo]?
+    private var persistenceEnabled = true
+    private var cacheGeneration = 0
 
     /// The scene-activation refresh in MainTabView also fires on cold launch,
     /// which would fetch the library a second time in parallel with load().
@@ -108,40 +194,8 @@ class GamesViewModel {
     private static let stoppedSessionGracePeriod: TimeInterval = 60
 
     init() {
-        if let data = UserDefaults.standard.data(forKey: "gfn.favoriteIds"),
-           let ids = try? JSONDecoder().decode([String].self, from: data)
-        {
-            favoriteIds = Set(ids)
-        }
-        if let data = UserDefaults.standard.data(forKey: "gfn.preferredStores"),
-           let stores = try? JSONDecoder().decode([String: String].self, from: data)
-        {
-            preferredStoreIds = stores
-        }
-        if let data = UserDefaults.standard.data(forKey: "gfn.recentlyPlayed"),
-           let ids = try? JSONDecoder().decode([String].self, from: data)
-        {
-            recentlyPlayedIds = ids
-        }
-        if let data = UserDefaults.standard.data(forKey: "gfn.streamSettings"),
-           let settings = try? JSONDecoder().decode(StreamSettings.self, from: data)
-        {
-            streamSettings = settings
-        }
-        if let data = UserDefaults.standard.data(forKey: "gfn.lastSession"),
-           let session = try? JSONDecoder().decode(LastSessionRecord.self, from: data)
-        {
-            lastSession = session
-        }
-        // tvOS currently caps at 60 Hz; clamp any saved value to the screen maximum.
-        // If Apple raises the cap in a future tvOS release this will automatically unlock.
-        let screenMax = (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.screen.maximumFramesPerSecond) ?? 60
-        if streamSettings.fps > screenMax {
-            streamSettings.fps = screenMax
-        }
-        streamSettings = streamSettings.normalizedForClient
-        let settings = streamSettings
-        gamesLog.debug("[Localization] preferred=\(Locale.preferredLanguages.first ?? "nil", privacy: .public) ui=\(L10n.localeCode, privacy: .public) keyboard=\(settings.keyboardLayout, privacy: .public) gameLanguage=\(settings.gameLanguage, privacy: .public) effectiveGameLanguage=\(settings.effectiveGameLanguage, privacy: .public)")
+        rebuildLibraryDerivations()
+        rebuildStoreDerivations()
     }
 
     // MARK: Computed — Entitled Resolutions & FPS
@@ -202,34 +256,54 @@ class GamesViewModel {
 
     // MARK: Load
 
-    private static let legacyLibraryCacheKey = "gfn.cache.libraryGames.v2"
-    private static let subscriptionCacheKey = "gfn.cache.subscription.v1"
-    private static let vpcIdCacheKey = "gfn.cache.vpcId"
+    private struct GamesFetchOutcome {
+        let games: [GameInfo]?
+        let errorMessage: String?
+    }
 
     func load(authManager: AuthManager) async {
-        // Invalidate stale v1 cache from the old panels API
-        UserDefaults.standard.removeObject(forKey: "gfn.cache.mainGames")
-        UserDefaults.standard.removeObject(forKey: "gfn.cache.libraryGames")
-        // Library metadata can exceed tvOS's per-value UserDefaults limit.
-        // Remove the old preference-backed cache before using the file cache.
-        UserDefaults.standard.removeObject(forKey: Self.legacyLibraryCacheKey)
+        persistenceEnabled = true
+        let writeGeneration = cacheGeneration
+        latestNetworkLibraryGames = nil
+        let snapshot = await persistence.loadGamesSnapshot()
+        guard persistenceEnabled else { return }
+        let catalogLocaleCode = L10n.nvidiaLocaleCode()
+        favoriteIds = snapshot.favoriteIds
+        preferredStoreIds = snapshot.preferredStoreIds
+        recentlyPlayedIds = snapshot.recentlyPlayedIds
+        streamSettings = (snapshot.streamSettings ?? StreamSettings()).normalizedForClient
+        lastSession = snapshot.lastSession
+        currentVpcId = snapshot.vpcId
 
-        // Show cached data instantly while fresh data loads in the background:
-        // library and catalog from files in Caches, subscription from UserDefaults.
-        if libraryGames.isEmpty, let cached = await Self.readLibraryCache() {
-            libraryGames = cached
+        // tvOS currently caps at 60 Hz; clamp any saved value to the screen maximum.
+        // If Apple raises the cap in a future tvOS release this will automatically unlock.
+        let screenMax = (UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.screen.maximumFramesPerSecond) ?? 60
+        if streamSettings.fps > screenMax {
+            streamSettings.fps = screenMax
         }
-        if subscription == nil, let cachedSub = loadCache(Self.subscriptionCacheKey, as: SubscriptionInfo.self) {
+        let settings = streamSettings
+        gamesLog.debug("[Localization] preferred=\(Locale.preferredLanguages.first ?? "nil", privacy: .public) ui=\(L10n.localeCode, privacy: .public) keyboard=\(settings.keyboardLayout, privacy: .public) gameLanguage=\(settings.gameLanguage, privacy: .public) effectiveGameLanguage=\(settings.effectiveGameLanguage, privacy: .public)")
+
+        // Show each cached dataset independently while its own network refresh runs.
+        if libraryGames.isEmpty, !snapshot.libraryGames.isEmpty {
+            libraryGames = snapshot.libraryGames
+        }
+        if subscription == nil, let cachedSub = snapshot.subscription {
             subscription = cachedSub
             normalizeStreamSettingsForCurrentEntitlements()
         }
-        if mainGames.isEmpty, let cachedCatalog = await Self.readCatalogCache() {
+        if mainGames.isEmpty,
+           let cachedCatalog = await persistence.loadCatalog(
+               localeCode: catalogLocaleCode,
+               vpcId: snapshot.vpcId ?? "GFN-PC"
+           )
+        {
             mainGames = cachedCatalog
         }
-        let hadCache = !libraryGames.isEmpty || !mainGames.isEmpty
-        isLoading = !hadCache
-        error = nil
-        libraryError = nil
+
+        catalogLoadPhase = .loading
+        libraryLoadPhase = .loading
+        libraryWarning = nil
 
         do {
             let token = try await authManager.resolveToken()
@@ -238,43 +312,50 @@ class GamesViewModel {
 
             // The catalog, library, and subscription queries all need the vpcId;
             // resolve it once up front instead of three times in parallel.
-            let vpcId = await resolveVpcIdCached(token: token, base: base)
+            // A failed server-info lookup still has a well-defined backend fallback.
+            // Pass it explicitly so GamesClient does not repeat the same lookup once
+            // for the catalog and again for the library.
+            let vpcId = await resolveVpcIdCached(
+                snapshot.vpcId,
+                token: token,
+                base: base,
+                generation: writeGeneration
+            ) ?? "GFN-PC"
+            guard persistenceEnabled else { return }
 
-            // Fetch main games, library, active sessions, and subscription in parallel
-            async let mainTask = gamesClient.fetchMainGames(token: token, streamingBaseUrl: base, vpcId: vpcId)
-            async let libraryTask = fetchLibrarySafe(token: token, base: base, vpcId: vpcId)
-            async let sessionsTask = fetchSessionsSafe(token: token, base: base)
-            async let subTask = fetchSubscriptionSafe(authManager: authManager, token: token, vpcId: vpcId ?? "")
-
-            let fetchedMain = try await mainTask
-            let panelLibrary = await libraryTask
-            activeSessions = await filterStopped(sessionsTask)
-            let sub = await subTask
-            if let sub {
-                gamesLog.info("[MES] tier=\(sub.membershipTier, privacy: .public) resolutions=\(String(describing: sub.entitledResolutions.map(\.resolutionLabel)), privacy: .public)")
-                subscription = sub
-                normalizeStreamSettingsForCurrentEntitlements()
-                saveCache(Self.subscriptionCacheKey, data: sub)
-            }
-
-            mainGames = fetchedMain
-            let catalogOwned = fetchedMain.filter(\.isInLibrary)
-            var merged = panelLibrary
-            var seen = Set(panelLibrary.map(\.id))
-            for game in catalogOwned where seen.insert(game.id).inserted {
-                merged.append(game)
-            }
-            libraryGames = merged
-
-            await Self.writeLibraryCache(merged)
-            await Self.writeCatalogCache(fetchedMain)
+            // Each dataset applies its result as soon as that request finishes;
+            // a slow catalog no longer holds the library or sessions in loading.
+            async let catalogUpdate: Void = loadCatalogFromNetwork(
+                token: token,
+                base: base,
+                vpcId: vpcId,
+                localeCode: catalogLocaleCode,
+                generation: writeGeneration
+            )
+            async let libraryUpdate: Void = loadLibraryFromNetwork(
+                token: token,
+                base: base,
+                vpcId: vpcId,
+                generation: writeGeneration
+            )
+            async let sessionsUpdate: Void = loadActiveSessionsFromNetwork(
+                token: token,
+                base: base,
+                generation: writeGeneration
+            )
+            async let subscriptionUpdate: Void = loadSubscriptionFromNetwork(
+                authManager: authManager,
+                token: token,
+                vpcId: vpcId,
+                generation: writeGeneration
+            )
+            _ = await (catalogUpdate, libraryUpdate, sessionsUpdate, subscriptionUpdate)
         } catch {
-            if !hadCache {
-                self.error = error.localizedDescription
-            }
+            guard persistenceEnabled else { return }
+            catalogLoadPhase = mainGames.isEmpty ? .failed(error.localizedDescription) : .loaded
+            libraryLoadPhase = libraryGames.isEmpty ? .failed(error.localizedDescription) : .loaded
         }
-        isLibraryLoading = false
-        isLoading = false
+        guard persistenceEnabled else { return }
         hasCompletedInitialLoad = true
     }
 
@@ -282,28 +363,77 @@ class GamesViewModel {
     /// previous launch when available (it changes only if NVIDIA migrates the
     /// account to another region) and revalidates it in the background, so the
     /// launch fetches don't wait a /v2/serverInfo round trip.
-    private func resolveVpcIdCached(token: String, base: String) async -> String? {
-        if let cached = UserDefaults.standard.string(forKey: Self.vpcIdCacheKey), !cached.isEmpty {
-            Task {
-                if let fresh = try? await MESClient.shared.fetchVpcId(token: token, base: base), !fresh.isEmpty {
-                    UserDefaults.standard.set(fresh, forKey: Self.vpcIdCacheKey)
-                }
+    private func resolveVpcIdCached(
+        _ cached: String?,
+        token: String,
+        base: String,
+        generation: Int
+    ) async -> String? {
+        if let cached, !cached.isEmpty {
+            currentVpcId = cached
+            Task { [weak self] in
+                _ = await self?.refreshVpcId(
+                    token: token,
+                    base: base,
+                    generation: generation
+                )
             }
             return cached
         }
-        let fetched = await ((try? MESClient.shared.fetchVpcId(token: token, base: base)) ?? nil)
+
+        return await refreshVpcId(token: token, base: base, generation: generation)
+    }
+
+    private func refreshVpcId(token: String, base: String, generation: Int) async -> String? {
+        if let vpcIdRefreshTask {
+            return await vpcIdRefreshTask.value
+        }
+
+        let task = Task<String?, Never> {
+            await ((try? MESClient.shared.fetchVpcId(token: token, base: base)) ?? nil)
+        }
+        vpcIdRefreshTask = task
+        let fetched = await task.value
+        vpcIdRefreshTask = nil
+        guard persistenceEnabled else { return nil }
         if let fetched, !fetched.isEmpty {
-            UserDefaults.standard.set(fetched, forKey: Self.vpcIdCacheKey)
+            currentVpcId = fetched
+            if generation == cacheGeneration {
+                await persistence.saveVpcId(fetched)
+            }
         }
         return fetched
     }
 
-    private func fetchLibrarySafe(token: String, base: String, vpcId: String?) async -> [GameInfo] {
-        await (try? gamesClient.fetchLibrary(token: token, streamingBaseUrl: base, vpcId: vpcId)) ?? []
+    private func fetchMainOutcome(token: String, base: String, vpcId: String?) async -> GamesFetchOutcome {
+        do {
+            let games = try await gamesClient.fetchMainGames(token: token, streamingBaseUrl: base, vpcId: vpcId)
+            return GamesFetchOutcome(games: games, errorMessage: nil)
+        } catch {
+            return GamesFetchOutcome(games: nil, errorMessage: error.localizedDescription)
+        }
     }
 
-    private func fetchSessionsSafe(token: String, base: String) async -> [ActiveSessionInfo] {
-        await (try? cloudMatchClient.getActiveSessions(token: token, base: base)) ?? []
+    private func fetchLibraryOutcome(token: String, base: String, vpcId: String?) async -> GamesFetchOutcome {
+        do {
+            let games = try await gamesClient.fetchLibrary(token: token, streamingBaseUrl: base, vpcId: vpcId)
+            return GamesFetchOutcome(games: games, errorMessage: nil)
+        } catch {
+            return GamesFetchOutcome(games: nil, errorMessage: error.localizedDescription)
+        }
+    }
+
+    private func fetchActiveSessionsCoalesced(token: String, base: String) async -> [ActiveSessionInfo] {
+        if let activeSessionsTask {
+            return await activeSessionsTask.value
+        }
+        let task = Task<[ActiveSessionInfo], Never> { [cloudMatchClient] in
+            await (try? cloudMatchClient.getActiveSessions(token: token, base: base)) ?? []
+        }
+        activeSessionsTask = task
+        let sessions = await task.value
+        activeSessionsTask = nil
+        return sessions
     }
 
     private func fetchSubscriptionSafe(authManager: AuthManager, token: String, vpcId: String) async -> SubscriptionInfo? {
@@ -311,76 +441,137 @@ class GamesViewModel {
         return try? await MESClient.shared.fetchSubscription(token: token, vpcId: vpcId, userId: userId)
     }
 
-    // MARK: Game Disk Caches
+    private func loadCatalogFromNetwork(
+        token: String,
+        base: String,
+        vpcId: String?,
+        localeCode: String,
+        generation: Int
+    ) async {
+        let outcome = await fetchMainOutcome(token: token, base: base, vpcId: vpcId)
+        guard persistenceEnabled else { return }
+        guard let fetchedMain = outcome.games else {
+            catalogLoadPhase = mainGames.isEmpty
+                ? .failed(outcome.errorMessage ?? L10n.text("failed_to_load_games"))
+                : .loaded
+            return
+        }
 
-    /// Game payloads can exceed what tvOS UserDefaults tolerates, so the catalog
-    /// and library live as JSON files in Caches. Read/write run off the main actor.
-    private nonisolated static var catalogCacheURL: URL? {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("gfn.catalog.v1.json")
-    }
+        mainGames = fetchedMain
+        catalogLoadPhase = .loaded
+        if generation == cacheGeneration {
+            await persistence.saveCatalog(fetchedMain, localeCode: localeCode, vpcId: vpcId)
+        }
 
-    private nonisolated static var libraryCacheURL: URL? {
-        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("gfn.library.v1.json")
-    }
-
-    private nonisolated static func readCatalogCache() async -> [GameInfo]? {
-        guard let url = catalogCacheURL, let data = try? Data(contentsOf: url) else { return nil }
-        let games = try? JSONDecoder().decode([GameInfo].self, from: data)
-        return (games?.isEmpty ?? true) ? nil : games
-    }
-
-    private nonisolated static func writeCatalogCache(_ games: [GameInfo]) async {
-        guard let url = catalogCacheURL, let data = try? JSONEncoder().encode(games) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    private nonisolated static func readLibraryCache() async -> [GameInfo]? {
-        guard let url = libraryCacheURL, let data = try? Data(contentsOf: url) else { return nil }
-        let games = try? JSONDecoder().decode([GameInfo].self, from: data)
-        return (games?.isEmpty ?? true) ? nil : games
-    }
-
-    private nonisolated static func writeLibraryCache(_ games: [GameInfo]) async {
-        guard let url = libraryCacheURL, let data = try? JSONEncoder().encode(games) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    private func loadCache<T: Decodable>(_ key: String, as type: T.Type) -> T? {
-        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(type, from: data)
-    }
-
-    private func saveCache(_ key: String, data: some Encodable) {
-        if let encoded = try? JSONEncoder().encode(data) {
-            UserDefaults.standard.set(encoded, forKey: key)
+        // If the library request completed first, fold in catalog ownership now.
+        let merged = mergeLibrary(
+            latestNetworkLibraryGames ?? libraryGames,
+            catalog: fetchedMain
+        )
+        if merged != libraryGames {
+            libraryGames = merged
+            if generation == cacheGeneration {
+                await persistence.saveLibraryGames(merged)
+            }
         }
     }
 
+    private func loadLibraryFromNetwork(
+        token: String,
+        base: String,
+        vpcId: String?,
+        generation: Int
+    ) async {
+        let outcome = await fetchLibraryOutcome(token: token, base: base, vpcId: vpcId)
+        guard persistenceEnabled else { return }
+        guard let panelLibrary = outcome.games else {
+            if libraryGames.isEmpty {
+                libraryLoadPhase = .failed(outcome.errorMessage ?? L10n.text("library_failed_to_load"))
+            } else {
+                libraryLoadPhase = .loaded
+                libraryWarning = outcome.errorMessage
+            }
+            return
+        }
+
+        latestNetworkLibraryGames = panelLibrary
+        let merged = mergeLibrary(panelLibrary, catalog: mainGames)
+        libraryGames = merged
+        libraryLoadPhase = .loaded
+        if generation == cacheGeneration {
+            await persistence.saveLibraryGames(merged)
+        }
+    }
+
+    private func loadActiveSessionsFromNetwork(token: String, base: String, generation: Int) async {
+        let sessions = await filterStopped(fetchActiveSessionsCoalesced(token: token, base: base))
+        guard persistenceEnabled, generation == cacheGeneration else { return }
+        activeSessions = sessions
+    }
+
+    private func loadSubscriptionFromNetwork(
+        authManager: AuthManager,
+        token: String,
+        vpcId: String,
+        generation: Int
+    ) async {
+        guard let subscription = await fetchSubscriptionSafe(authManager: authManager, token: token, vpcId: vpcId) else {
+            return
+        }
+        guard persistenceEnabled else { return }
+        gamesLog.info("[MES] tier=\(subscription.membershipTier, privacy: .public) resolutions=\(String(describing: subscription.entitledResolutions.map(\.resolutionLabel)), privacy: .public)")
+        self.subscription = subscription
+        normalizeStreamSettingsForCurrentEntitlements()
+        if generation == cacheGeneration {
+            await persistence.saveSubscription(subscription)
+        }
+    }
+
+    private func mergeLibrary(_ panelLibrary: [GameInfo], catalog: [GameInfo]) -> [GameInfo] {
+        var merged = panelLibrary
+        var seen = Set(panelLibrary.map(\.id))
+        for game in catalog where game.isInLibrary && seen.insert(game.id).inserted {
+            merged.append(game)
+        }
+        return merged
+    }
+
     func refreshLibrary(authManager: AuthManager) async {
-        guard !isLibraryLoading, hasCompletedInitialLoad else { return }
-        isLibraryLoading = true
-        libraryError = nil
-        defer { isLibraryLoading = false }
+        guard libraryLoadPhase != .loading, hasCompletedInitialLoad else { return }
+        let writeGeneration = cacheGeneration
+        libraryLoadPhase = .loading
+        libraryWarning = nil
 
         do {
             let token = try await authManager.resolveToken()
             let streamingUrl = authManager.session?.provider.streamingServiceUrl ?? NVIDIAAuth.defaultStreamingUrl
             let base = streamingUrl.hasSuffix("/") ? String(streamingUrl.dropLast()) : streamingUrl
-            let vpcId = UserDefaults.standard.string(forKey: Self.vpcIdCacheKey)
-            libraryGames = try await gamesClient.fetchLibrary(token: token, streamingBaseUrl: base, vpcId: vpcId)
-            await Self.writeLibraryCache(libraryGames)
+            let refreshed = try await gamesClient.fetchLibrary(token: token, streamingBaseUrl: base, vpcId: currentVpcId)
+            guard persistenceEnabled else { return }
+            libraryGames = mergeLibrary(refreshed, catalog: mainGames)
+            libraryLoadPhase = .loaded
+            if writeGeneration == cacheGeneration {
+                await persistence.saveLibraryGames(libraryGames)
+            }
         } catch {
-            libraryError = error.localizedDescription
+            guard persistenceEnabled else { return }
+            if libraryGames.isEmpty {
+                libraryLoadPhase = .failed(error.localizedDescription)
+            } else {
+                libraryLoadPhase = .loaded
+                libraryWarning = error.localizedDescription
+            }
         }
     }
 
     func refreshActiveSessions(authManager: AuthManager) async {
+        let generation = cacheGeneration
         guard let token = try? await authManager.resolveToken() else { return }
         let streamingUrl = authManager.session?.provider.streamingServiceUrl ?? NVIDIAAuth.defaultStreamingUrl
         let base = streamingUrl.hasSuffix("/") ? String(streamingUrl.dropLast()) : streamingUrl
-        activeSessions = await filterStopped((try? cloudMatchClient.getActiveSessions(token: token, base: base)) ?? [])
+        let sessions = await filterStopped(fetchActiveSessionsCoalesced(token: token, base: base))
+        guard persistenceEnabled, generation == cacheGeneration else { return }
+        activeSessions = sessions
     }
 
     /// Called when the user ends a session: removes it from the UI immediately
@@ -400,24 +591,137 @@ class GamesViewModel {
         return sessions.filter { recentlyStoppedSessions[$0.sessionId] == nil }
     }
 
+    // MARK: Cached Library & Store Derivations
+
+    private func rebuildLibraryDerivations() {
+        libraryFilterOptions = GameFilterOptions(
+            games: libraryGames,
+            favoriteIds: favoriteIds,
+            context: .library
+        )
+        rebuildLibraryFilterBaseCount()
+        rebuildFilteredLibraryGames()
+    }
+
+    private func rebuildLibraryFilterBaseCount() {
+        libraryFilterBaseCount = GameFilterEngine.count(
+            in: libraryGames,
+            context: .library,
+            state: GameFilterState(),
+            searchText: librarySearchText,
+            favoriteIds: favoriteIds
+        )
+    }
+
+    private func rebuildFilteredLibraryGames() {
+        filteredLibraryGames = filteredGames(
+            libraryGames,
+            context: .library,
+            state: libraryFilterState,
+            searchText: librarySearchText,
+            sortOrder: librarySortOrder
+        )
+    }
+
+    private func rebuildStoreDerivations() {
+        storeFilterOptions = GameFilterOptions(
+            games: mainGames,
+            favoriteIds: favoriteIds,
+            context: .store
+        )
+        rebuildStoreFilterBaseCount()
+        rebuildFilteredStoreGames()
+    }
+
+    private func rebuildStoreFilterBaseCount() {
+        storeFilterBaseCount = GameFilterEngine.count(
+            in: mainGames,
+            context: .store,
+            state: GameFilterState(),
+            searchText: storeSearchText,
+            favoriteIds: favoriteIds
+        )
+    }
+
+    private func rebuildFilteredStoreGames() {
+        filteredStoreGames = filteredGames(
+            mainGames,
+            context: .store,
+            state: storeFilterState,
+            searchText: storeSearchText,
+            sortOrder: storeSortOrder
+        )
+    }
+
+    func libraryPreviewCount(for state: GameFilterState) -> Int {
+        GameFilterEngine.count(
+            in: libraryGames,
+            context: .library,
+            state: state,
+            searchText: librarySearchText,
+            favoriteIds: favoriteIds
+        )
+    }
+
+    func storePreviewCount(for state: GameFilterState) -> Int {
+        GameFilterEngine.count(
+            in: mainGames,
+            context: .store,
+            state: state,
+            searchText: storeSearchText,
+            favoriteIds: favoriteIds
+        )
+    }
+
+    private func filteredGames(
+        _ games: [GameInfo],
+        context: GameFilterContext,
+        state: GameFilterState,
+        searchText: String,
+        sortOrder: LibrarySortOrder
+    ) -> [GameInfo] {
+        GameFilterEngine.apply(
+            to: games,
+            context: context,
+            state: state,
+            searchText: searchText,
+            sortOrder: sortOrder,
+            favoriteIds: favoriteIds,
+            recentlyPlayedIds: recentlyPlayedIds
+        )
+    }
+
     // MARK: Recently Played
 
     func recordPlayed(_ game: GameInfo) {
-        recentlyPlayedIds.removeAll { $0 == game.id }
-        recentlyPlayedIds.insert(game.id, at: 0)
-        if recentlyPlayedIds.count > 10 {
-            recentlyPlayedIds = Array(recentlyPlayedIds.prefix(10))
+        var ids = recentlyPlayedIds
+        ids.removeAll { $0 == game.id }
+        ids.insert(game.id, at: 0)
+        if ids.count > 10 {
+            ids = Array(ids.prefix(10))
         }
-        let data = try? JSONEncoder().encode(recentlyPlayedIds)
-        UserDefaults.standard.set(data, forKey: "gfn.recentlyPlayed")
+        recentlyPlayedIds = ids
+        let generation = cacheGeneration
+        Task { [weak self] in
+            guard let self,
+                  persistenceEnabled,
+                  cacheGeneration == generation else { return }
+            await persistence.saveRecentlyPlayedIds(ids)
+        }
     }
 
     // MARK: Preferred Store
 
     func setPreferredStore(gameId: String, variantId: String) {
         preferredStoreIds[gameId] = variantId
-        let data = try? JSONEncoder().encode(preferredStoreIds)
-        UserDefaults.standard.set(data, forKey: "gfn.preferredStores")
+        let stores = preferredStoreIds
+        let generation = cacheGeneration
+        Task { [weak self] in
+            guard let self,
+                  persistenceEnabled,
+                  cacheGeneration == generation else { return }
+            await persistence.savePreferredStoreIds(stores)
+        }
     }
 
     func preferredVariantId(for game: GameInfo) -> String? {
@@ -452,24 +756,80 @@ class GamesViewModel {
     // MARK: Persistence
 
     func saveFavorites() {
-        let data = try? JSONEncoder().encode(Array(favoriteIds))
-        UserDefaults.standard.set(data, forKey: "gfn.favoriteIds")
+        let ids = favoriteIds
+        let generation = cacheGeneration
+        Task { [weak self] in
+            guard let self,
+                  persistenceEnabled,
+                  cacheGeneration == generation else { return }
+            await persistence.saveFavoriteIds(ids)
+        }
     }
 
     func saveSettings() {
-        let data = try? JSONEncoder().encode(streamSettings)
-        UserDefaults.standard.set(data, forKey: "gfn.streamSettings")
+        let settings = streamSettings
+        let generation = cacheGeneration
+        Task { [weak self] in
+            guard let self,
+                  persistenceEnabled,
+                  cacheGeneration == generation else { return }
+            await persistence.saveStreamSettings(settings)
+        }
     }
 
     func saveLastSession(_ record: LastSessionRecord) {
         lastSession = record
-        let data = try? JSONEncoder().encode(record)
-        UserDefaults.standard.set(data, forKey: "gfn.lastSession")
+        let generation = cacheGeneration
+        Task { [weak self] in
+            guard let self,
+                  persistenceEnabled,
+                  cacheGeneration == generation else { return }
+            await persistence.saveLastSession(record)
+        }
     }
 
     func clearLastSession() {
         lastSession = nil
-        UserDefaults.standard.removeObject(forKey: "gfn.lastSession")
+        let generation = cacheGeneration
+        Task { [weak self] in
+            guard let self,
+                  persistenceEnabled,
+                  cacheGeneration == generation else { return }
+            await persistence.saveLastSession(nil)
+        }
+    }
+
+    func prepareForCacheClear() {
+        cacheGeneration &+= 1
+    }
+
+    func prepareForDataReset() {
+        cacheGeneration &+= 1
+        persistenceEnabled = false
+        activeSessionsTask?.cancel()
+        activeSessionsTask = nil
+        vpcIdRefreshTask?.cancel()
+        vpcIdRefreshTask = nil
+    }
+
+    func resetAllData() async {
+        mainGames = []
+        libraryGames = []
+        activeSessions = []
+        catalogLoadPhase = .idle
+        libraryLoadPhase = .idle
+        libraryWarning = nil
+        favoriteIds = []
+        preferredStoreIds = [:]
+        recentlyPlayedIds = []
+        streamSettings = StreamSettings().normalizedForClient
+        subscription = nil
+        resumableSession = nil
+        lastSession = nil
+        currentVpcId = nil
+        latestNetworkLibraryGames = nil
+        hasCompletedInitialLoad = false
+        recentlyStoppedSessions = [:]
     }
 
     private func normalizeStreamSettingsForCurrentEntitlements() {
@@ -486,78 +846,5 @@ class GamesViewModel {
         if !fpsValues.contains(streamSettings.fps), let fallbackFPS = fpsValues.last {
             streamSettings.fps = fallbackFPS
         }
-    }
-
-    // MARK: Zone Auto-Selection
-
-    func measureTopZones() async {
-        guard let zones = try? await ZoneClient.shared.fetchZones() else { return }
-        var measured = zones
-        await withTaskGroup(of: (String, Int?).self) { group in
-            for zone in zones {
-                group.addTask {
-                    let ping = await ZoneClient.shared.measurePing(to: zone.zoneUrl)
-                    return (zone.id, ping)
-                }
-            }
-            for await (id, ping) in group {
-                if let idx = measured.firstIndex(where: { $0.id == id }) {
-                    measured[idx].pingMs = ping
-                    measured[idx].isMeasuring = false
-                }
-            }
-        }
-        let reachable = measured.filter { $0.pingMs != nil }
-        let isUnlimited = subscription?.isUnlimited ?? false
-        topZones = Array(reachable
-            .sorted { autoZoneScore($0, maxPing: reachable, maxQueue: reachable, isUnlimited: isUnlimited) <
-                autoZoneScore($1, maxPing: reachable, maxQueue: reachable, isUnlimited: isUnlimited)
-            }
-            .prefix(5))
-        let measuredTop = topZones
-        gamesLog.info("[Zones] top 5: \(measuredTop.map { "\($0.id) ping=\($0.pingMs!)ms queue=\($0.queuePosition)" }.joined(separator: ", "), privacy: .public)")
-    }
-
-    func bestZoneUrl() async -> String? {
-        guard !topZones.isEmpty else { return nil }
-        // Re-ping candidates and refresh queue data for current conditions
-        var refreshed = topZones
-        if let freshZones = try? await ZoneClient.shared.fetchZones() {
-            let queueLookup = Dictionary(uniqueKeysWithValues: freshZones.map { ($0.id, $0.queuePosition) })
-            for i in refreshed.indices {
-                if let q = queueLookup[refreshed[i].id] {
-                    refreshed[i].queuePosition = q
-                }
-            }
-        }
-        await withTaskGroup(of: (String, Int?).self) { group in
-            for zone in refreshed {
-                group.addTask {
-                    let ping = await ZoneClient.shared.measurePing(to: zone.zoneUrl)
-                    return (zone.id, ping)
-                }
-            }
-            for await (id, ping) in group {
-                if let idx = refreshed.firstIndex(where: { $0.id == id }) {
-                    refreshed[idx].pingMs = ping
-                }
-            }
-        }
-        let reachable = refreshed.filter { $0.pingMs != nil }
-        let isUnlimited = subscription?.isUnlimited ?? false
-        let best = reachable.autoZone(isUnlimited: isUnlimited)
-        if let best {
-            gamesLog.info("[Zones] best at launch: \(best.zoneUrl, privacy: .public) (ping=\(best.pingMs!, privacy: .public)ms queue=\(best.queuePosition, privacy: .public), unlimited=\(isUnlimited, privacy: .public))")
-        }
-        return best?.zoneUrl
-    }
-
-    private func autoZoneScore(_ zone: GFNZone, maxPing: [GFNZone], maxQueue: [GFNZone], isUnlimited: Bool) -> Double {
-        if isUnlimited {
-            return Double(zone.pingMs ?? .max)
-        }
-        let mp = Double(Swift.max(maxPing.compactMap(\.pingMs).max() ?? 1, 1))
-        let mq = Double(Swift.max(maxQueue.map(\.queuePosition).max() ?? 1, 1))
-        return (Double(zone.pingMs ?? Int(mp)) / mp) * 0.4 + (Double(zone.queuePosition) / mq) * 0.6
     }
 }

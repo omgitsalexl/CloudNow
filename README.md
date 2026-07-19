@@ -6,9 +6,6 @@ A native GeForce NOW client for Apple TV. Stream your entire PC game library dir
 
 > **Personal use / sideload only.** This project is not affiliated with, endorsed by, or sponsored by NVIDIA. NVIDIA and GeForce NOW are trademarks of NVIDIA Corporation.
 
-> [!WARNING]
-> CloudNow is under active development. Expect bugs, lots of them
-
 ---
 
 ## Installation
@@ -38,7 +35,7 @@ Follow the [Getting Started](#getting-started) steps below if you want to build 
 - **Renderer metadata preservation** — decoded color metadata is tracked through the render path and the format description cache is refreshed when color characteristics change, not just when resolution changes
 - **Session diagnostics** — diagnostic HUD can show color preference, requested mode, detected mode, display HDR support, fallback reason, decoder path, pixel format, transfer function, and bit depth
 - **Session queue UI** — shows queue phase ("In queue · Position X" → "Preparing your game"); waits indefinitely in queue with position updates; 180-second setup timeout after queue clears; requires two consecutive ready polls before presenting the stream; plays mandatory queue ads via AVPlayer and reports lifecycle events back to CloudMatch
-- **Zone/region selection** — Settings → Server Region shows live queue depths and ping per zone; Automatic mode picks the best zone by weighted score (40% ping + 60% queue depth); powered by the PrintedWaste community API
+- **Server location** — Settings → Server Location offers Automatic (default), Region, and Servers. Automatic lets NVIDIA route each session, Region pins one of the regions returned by NVIDIA, and Servers drills down through country → city → dedicated server with live ping and queue information; includes a Test Network tool measuring ping, jitter, and packet loss to the selected route
 - **Surround audio** — Audio Format setting with Automatic, Stereo, and 5.1 Surround; 5.1 uses the multichannel Opus stream the service offers and requires a receiver or soundbar; a custom WebRTC audio device keeps output latency low
 - **Microphone support** — voice chat via AirPods or any Bluetooth headset; toggle in Settings; permission requested on first use; if no valid input route exists, CloudNow falls back to playback-only audio instead of breaking session audio
 - **Favorites** — long-press any game card in Library or Store to add/remove from Favorites; persisted locally
@@ -97,7 +94,7 @@ swiftformat --lint --config .swiftformat CloudNow
 swiftlint --strict --config .swiftlint.yml CloudNow
 ```
 
-These commands require the exact tool versions pinned by CI: SwiftFormat 0.61.1 and SwiftLint 0.63.3. See [Linting](#linting) for installation and version details.
+These commands require the exact tool versions pinned by CI: SwiftFormat 0.62.1 and SwiftLint 0.65.0. See [Linting](#linting) for installation and version details.
 
 ### 5. Build & Run
 
@@ -222,11 +219,11 @@ After installing, every `git commit` runs SwiftFormat then SwiftLint --fix again
 
 ### Pinned versions
 
-CI and the pre-commit hooks use SwiftLint 0.63.3 and SwiftFormat 0.61.1. Local tools must match these exact versions; newer formatter or linter releases can enable additional rules and produce results that differ from CI. Verify before running the checks:
+CI and the pre-commit hooks use SwiftLint 0.65.0 and SwiftFormat 0.62.1. Local tools must match these exact versions; newer formatter or linter releases can enable additional rules and produce results that differ from CI. Verify before running the checks:
 
 ```bash
-swiftformat --version  # expected: 0.61.1
-swiftlint version      # expected: 0.63.3
+swiftformat --version  # expected: 0.62.1
+swiftlint version      # expected: 0.65.0
 ```
 
 When Homebrew provides a newer release, use the pinned pre-commit environments or the same release artifacts referenced in `.github/workflows/lint.yml`.
@@ -245,7 +242,7 @@ CloudNow/
 │   ├── CloudMatchClient.swift      Session create/poll/stop/active-sessions, color-aware request fields
 │   ├── GamesClient.swift           Game catalog via GraphQL persisted query
 │   ├── MESClient.swift             Subscription tier + entitled resolutions/FPS from the MES API
-│   └── ZoneClient.swift            Zone list, ping probes, and queue-depth scoring (PrintedWaste API)
+│   └── ZoneClient.swift            Dedicated-server list, ping probes, and queue data (PrintedWaste API)
 ├── Streaming/
 │   ├── GFNStreamController.swift   WebRTC peer connection lifecycle, color negotiation state, audio session setup
 │   ├── SignalingClient.swift        WebSocket signaling — SDP offer/answer + ICE
@@ -317,7 +314,7 @@ This means an HDR request can legitimately fall back to SDR10 or SDR8, and the a
 
 - **No App Store.** NVIDIA has not published a public API for third-party GFN clients. Sideloading only.
 - **Queue ad playback.** During high demand GFN shows ads while in queue. The app plays them via AVPlayer and reports lifecycle events (start/pause/finish) back to CloudMatch.
-- **Zone/region selection.** Settings → Server Region lets you pick a specific zone or leave it on Automatic (40% ping + 60% queue depth scoring). Zone list + queue depths fetched from the PrintedWaste community API.
+- **Server location.** Region names and addresses come from NVIDIA's serverInfo endpoint. The manual Servers browser gets queue-depth and location metadata from the PrintedWaste community API, which may lag behind actual queue conditions; ping values are measured locally after opening a city. Dedicated servers pinned by older builds remain selected after upgrading.
 - **HDR depends on the full pipeline.** A selected HDR-capable mode does not guarantee the server will deliver HDR, and a 10-bit stream is not automatically HDR.
 - **AV1 currently uses the software I420 path.** On the current implementation this falls back to SDR 8-bit BT.709 rather than preserving SDR10 or HDR metadata.
 - **Color diagnostics are only as good as decoded metadata.** If the decoder or software conversion path strips metadata, CloudNow will conservatively report fallback or unknown modes instead of guessing.

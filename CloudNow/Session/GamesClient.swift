@@ -1,9 +1,9 @@
 import Foundation
 import os.log
 
-private let gamesLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Games")
+private nonisolated let gamesLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "Games")
 
-struct LibraryFetchResult {
+nonisolated struct LibraryFetchResult {
     let games: [GameInfo]
     let warning: String?
 }
@@ -19,7 +19,6 @@ actor GamesClient {
     private static let clientVersion = NVIDIAAuth.gfnClientVersion
 
     private let urlSession = URLSession.shared
-    private var metadataCache: [String: AppData] = [:]
     private var localeCode: String {
         L10n.nvidiaLocaleCode()
     }
@@ -461,7 +460,6 @@ actor GamesClient {
         for start in stride(from: 0, to: appIds.count, by: chunkSize) {
             let chunk = Array(appIds[start ..< min(start + chunkSize, appIds.count)])
             let payloadApps = try await fetchMetadataChunk(token: token, appIds: chunk, vpcId: vpcId)
-            cacheMetadata(payloadApps)
             apps.append(contentsOf: payloadApps)
         }
         return apps
@@ -475,8 +473,7 @@ actor GamesClient {
         for start in stride(from: 0, to: appIds.count, by: chunkSize) {
             let chunk = Array(appIds[start ..< min(start + chunkSize, appIds.count)])
             do {
-                let payloadApps = try await fetchMetadataChunk(token: token, appIds: chunk, vpcId: vpcId)
-                cacheMetadata(payloadApps)
+                _ = try await fetchMetadataChunk(token: token, appIds: chunk, vpcId: vpcId)
             } catch is CancellationError {
                 throw CancellationError()
             } catch GamesError.unauthorized {
@@ -512,13 +509,6 @@ actor GamesClient {
             throw GamesError.fetchFailed("GraphQL response did not contain app metadata")
         }
         return apps
-    }
-
-    private func cacheMetadata(_ apps: [AppData]) {
-        for app in apps {
-            guard let id = app.id?.stringValue else { continue }
-            metadataCache[id] = app
-        }
     }
 
     // MARK: - Owned Apps
@@ -775,12 +765,12 @@ actor GamesClient {
 
 // MARK: - Response Types
 
-private struct ServerInfoResponse: Decodable {
+private nonisolated struct ServerInfoResponse: Decodable {
     let requestStatus: RequestStatus?
     struct RequestStatus: Decodable { let serverId: String? }
 }
 
-private struct MetadataResponse: Decodable {
+private nonisolated struct MetadataResponse: Decodable {
     let data: MetadataData?
     let errors: [GQLError]?
     struct MetadataData: Decodable {
@@ -791,7 +781,7 @@ private struct MetadataResponse: Decodable {
     }
 }
 
-private struct BrowseResponse: Decodable {
+private nonisolated struct BrowseResponse: Decodable {
     let data: BrowseData?
     let errors: [GQLError]?
 
@@ -851,13 +841,13 @@ private struct BrowseResponse: Decodable {
     }
 }
 
-private struct GQLError: Decodable { let message: String }
+private nonisolated struct GQLError: Decodable { let message: String }
 
-private struct MetadataFetchResult {
+private nonisolated struct MetadataFetchResult {
     let failedChunkCount: Int
 }
 
-private struct OwnedAppsResponse: Decodable {
+private nonisolated struct OwnedAppsResponse: Decodable {
     let data: OwnedAppsData?
     let errors: [GQLError]?
     struct OwnedAppsData: Decodable {
@@ -865,12 +855,12 @@ private struct OwnedAppsResponse: Decodable {
     }
 }
 
-private struct AppsContainer: Decodable {
+private nonisolated struct AppsContainer: Decodable {
     let items: [AppData]
     let pageInfo: PageInfo
 }
 
-private struct PageInfo: Decodable {
+private nonisolated struct PageInfo: Decodable {
     let hasNextPage: Bool?
     let endCursor: String?
     let totalCount: Int?
@@ -882,7 +872,7 @@ private struct PageInfo: Decodable {
     }
 }
 
-private struct AppData: Decodable {
+private nonisolated struct AppData: Decodable {
     let id: AnyCodableGameId?
     let title: String?
     let longDescription: String?
@@ -949,7 +939,7 @@ private struct AppData: Decodable {
     }
 }
 
-private struct AnyCodableGameId: Decodable {
+private nonisolated struct AnyCodableGameId: Decodable {
     let stringValue: String
     init(from decoder: Decoder) throws {
         if let int = try? Int(from: decoder) {
@@ -962,7 +952,7 @@ private struct AnyCodableGameId: Decodable {
 
 // MARK: - Errors
 
-enum GamesError: Error, LocalizedError {
+nonisolated enum GamesError: Error, LocalizedError {
     case fetchFailed(String)
     case httpStatus(Int, String)
     case graphql(String)

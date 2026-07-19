@@ -7,7 +7,7 @@ private let authLog = Logger(subsystem: "com.owenselles.CloudNow2", category: "A
 
 // MARK: - AuthSession (persisted)
 
-struct AuthSession: Codable {
+nonisolated struct AuthSession: Codable {
     var provider: LoginProvider
     var tokens: AuthTokens
     var user: AuthUser
@@ -22,6 +22,12 @@ enum LoginPhase: Equatable {
     case failed(String)
 }
 
+enum AuthStartupPhase: Equatable {
+    case pending
+    case restoringSession
+    case ready
+}
+
 // MARK: - AuthManager
 
 @Observable
@@ -29,27 +35,36 @@ enum LoginPhase: Equatable {
 final class AuthManager {
     private(set) var session: AuthSession?
     private(set) var loginPhase: LoginPhase = .idle
+    private(set) var startupPhase: AuthStartupPhase = .pending
 
     var isAuthenticated: Bool {
         session != nil
     }
 
     private let api = NVIDIAAuthAPI()
+    private let persistence = AppPersistenceStore.shared
     private var loginTask: Task<Void, Never>?
     private var activeRefreshTask: Task<AuthSession, Error>?
     private var refreshTimer: Task<Void, Never>?
+    private var credentialGeneration = 0
 
     private static let bgTaskID = "com.owenselles.CloudNow.tokenRefresh"
 
     // MARK: Lifecycle
 
     func initialize() async {
-        guard let stored = try? KeychainService.load(),
-              let saved = try? JSONDecoder().decode(AuthSession.self, from: stored)
-        else { return }
+        guard startupPhase == .pending else { return }
+        startupPhase = .restoringSession
+
+        guard let saved = try? await persistence.loadAuthSession() else {
+            startupPhase = .ready
+            return
+        }
+
         session = saved
         scheduleProactiveRefresh()
         scheduleBackgroundRefresh()
+        startupPhase = .ready
         await refreshIfNeeded()
     }
 
@@ -57,6 +72,8 @@ final class AuthManager {
 
     func login(with provider: LoginProvider? = nil) {
         loginTask?.cancel()
+        credentialGeneration &+= 1
+        let generation = credentialGeneration
         loginTask = Task {
             loginPhase = .idle
             do {
@@ -125,16 +142,24 @@ final class AuthManager {
                     }
                 }
 
+                try Task.checkCancellation()
+                guard credentialGeneration == generation else {
+                    throw CancellationError()
+                }
                 let newSession = AuthSession(provider: selectedProvider, tokens: tokens, user: user)
                 session = newSession
                 scheduleProactiveRefresh()
                 scheduleBackgroundRefresh()
-                try persist(newSession)
+                try await persist(newSession)
                 loginPhase = .idle
             } catch is CancellationError {
-                loginPhase = .idle
+                if credentialGeneration == generation {
+                    loginPhase = .idle
+                }
             } catch {
-                loginPhase = .failed(error.localizedDescription)
+                if credentialGeneration == generation {
+                    loginPhase = .failed(error.localizedDescription)
+                }
             }
         }
     }
@@ -148,10 +173,32 @@ final class AuthManager {
     // MARK: Logout
 
     func logout() {
-        refreshTimer?.cancel()
+        invalidateAuthenticationWork()
         session = nil
         loginPhase = .idle
-        KeychainService.delete()
+        Task { await persistence.deleteAuthSession() }
+    }
+
+    /// Stops authentication work before Reset All Data removes credentials.
+    /// The visible session remains available until cleanup finishes and logout
+    /// performs the final UI transition.
+    func prepareForDataReset() {
+        invalidateAuthenticationWork()
+    }
+
+    private func invalidateAuthenticationWork() {
+        credentialGeneration &+= 1
+        cancelAuthenticationWork()
+    }
+
+    private func cancelAuthenticationWork() {
+        loginTask?.cancel()
+        loginTask = nil
+        activeRefreshTask?.cancel()
+        activeRefreshTask = nil
+        refreshTimer?.cancel()
+        refreshTimer = nil
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.bgTaskID)
     }
 
     // MARK: Token Refresh
@@ -188,15 +235,15 @@ final class AuthManager {
     func refreshIfNeeded() async {
         guard let s = session, s.tokens.isNearExpiry else { return }
         do {
-            let refreshed = try await refresh(session: s)
-            session = refreshed
-            try? persist(refreshed)
+            _ = try await refresh(session: s)
+        } catch is CancellationError {
+            return
         } catch {
             if s.tokens.isExpired {
                 authLog.error("[Auth] Token expired and refresh failed: \(error, privacy: .private) — clearing session, re-login required")
                 refreshTimer?.cancel()
                 session = nil
-                KeychainService.delete()
+                await persistence.deleteAuthSession()
             } else {
                 authLog.warning("[Auth] Refresh failed but token still valid (\(Int(s.tokens.expiresAt.timeIntervalSinceNow), privacy: .public)s left) — keeping session")
             }
@@ -209,16 +256,17 @@ final class AuthManager {
         if let existing = activeRefreshTask {
             return try await existing.value
         }
+        let generation = credentialGeneration
         let task = Task<AuthSession, Error> { @MainActor [weak self] in
             guard let self else { throw AuthError.noSession }
             defer { self.activeRefreshTask = nil }
-            return try await performRefresh(session: s)
+            return try await performRefresh(session: s, generation: generation)
         }
         activeRefreshTask = task
         return try await task.value
     }
 
-    private func performRefresh(session s: AuthSession) async throws -> AuthSession {
+    private func performRefresh(session s: AuthSession, generation: Int) async throws -> AuthSession {
         var updated = s
         authLog.debug("[Auth] performRefresh: accessToken expires=\(String(describing: s.tokens.expiresAt), privacy: .public), clientToken=\(s.tokens.clientToken != nil ? "yes" : "nil", privacy: .public) expires=\(s.tokens.clientTokenExpiresAt?.description ?? "nil", privacy: .public), refreshToken=\(s.tokens.refreshToken != nil ? "yes" : "nil", privacy: .public), idToken=\(s.tokens.idToken != nil ? "yes" : "nil", privacy: .public)")
         let clientTokenUsable = s.tokens.clientToken != nil &&
@@ -302,10 +350,14 @@ final class AuthManager {
         } catch {
             authLog.warning("[Auth] warning: failed to re-bootstrap client_token after refresh: \(error, privacy: .private)")
         }
+        try Task.checkCancellation()
+        guard credentialGeneration == generation else {
+            throw CancellationError()
+        }
         session = updated
         scheduleProactiveRefresh()
         scheduleBackgroundRefresh()
-        try persist(updated)
+        try await persist(updated)
         return updated
     }
 
@@ -333,8 +385,7 @@ final class AuthManager {
         try? BGTaskScheduler.shared.submit(request)
     }
 
-    private func persist(_ s: AuthSession) throws {
-        let data = try JSONEncoder().encode(s)
-        try KeychainService.save(data)
+    private func persist(_ s: AuthSession) async throws {
+        try await persistence.saveAuthSession(s)
     }
 }

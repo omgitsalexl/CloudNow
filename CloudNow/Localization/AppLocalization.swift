@@ -1,79 +1,85 @@
 import Foundation
 
 enum L10n {
-    private static let tablesByLocale: [String: [String: String]] = {
-        var tables: [String: [String: String]] = [
-            "ar": L10nAR.strings,
-            "ca": L10nCA.strings,
-            "cs": L10nCS.strings,
-            "da": L10nDA.strings,
-            "el": L10nEL.strings,
-            "fi": L10nFI.strings,
-            "he": L10nHE.strings,
-            "hi": L10nHI.strings,
-            "hr": L10nHR.strings,
-            "hu": L10nHU.strings,
-            "id": L10nID.strings,
-            "ja": L10nJA.strings,
-            "ko": L10nKO.strings,
-            "ms": L10nMS.strings,
-            "nb": L10nNB.strings,
-            "pl": L10nPL.strings,
-            "ro": L10nRO.strings,
-            "ru": L10nRU.strings,
-            "sk": L10nSK.strings,
-            "sv": L10nSV.strings,
-            "th": L10nTH.strings,
-            "tr": L10nTR.strings,
-            "uk": L10nUK.strings,
-            "vi": L10nVI.strings,
-            "en": L10nEN.strings,
-            "fr": L10nFR.strings,
-            "de": L10nDE.strings,
-            "es": L10nES.strings,
-            "it": L10nIT.strings,
-            "pt-BR": L10nPTBR.strings,
-            "pt-PT": L10nPTPT.strings,
-            "zh-Hans": L10nZHHans.strings,
-            "zh-Hant": L10nZHHant.strings,
+    private typealias TableProvider = () -> [String: String]
+
+    /// Provider closures keep translation dictionaries lazy: only the active table and English
+    /// fallback are materialized instead of all supported locales at app launch.
+    private static let tableProvidersByLocale: [String: TableProvider] = {
+        var providers: [String: TableProvider] = [
+            "ar": { L10nAR.strings },
+            "ca": { L10nCA.strings },
+            "cs": { L10nCS.strings },
+            "da": { L10nDA.strings },
+            "el": { L10nEL.strings },
+            "fi": { L10nFI.strings },
+            "he": { L10nHE.strings },
+            "hi": { L10nHI.strings },
+            "hr": { L10nHR.strings },
+            "hu": { L10nHU.strings },
+            "id": { L10nID.strings },
+            "ja": { L10nJA.strings },
+            "ko": { L10nKO.strings },
+            "ms": { L10nMS.strings },
+            "nb": { L10nNB.strings },
+            "pl": { L10nPL.strings },
+            "ro": { L10nRO.strings },
+            "ru": { L10nRU.strings },
+            "sk": { L10nSK.strings },
+            "sv": { L10nSV.strings },
+            "th": { L10nTH.strings },
+            "tr": { L10nTR.strings },
+            "uk": { L10nUK.strings },
+            "vi": { L10nVI.strings },
+            "en": { L10nEN.strings },
+            "fr": { L10nFR.strings },
+            "de": { L10nDE.strings },
+            "es": { L10nES.strings },
+            "it": { L10nIT.strings },
+            "pt-BR": { L10nPTBR.strings },
+            "pt-PT": { L10nPTPT.strings },
+            "zh-Hans": { L10nZHHans.strings },
+            "zh-Hant": { L10nZHHant.strings },
         ]
 
-        let aliases: [(table: [String: String], codes: [String])] = [
-            (L10nEN.strings, ["en-AU", "en-CA", "en-IN", "en-IE", "en-NZ", "en-SG", "en-ZA", "en-GB", "en-US"]),
-            (L10nFR.strings, ["fr-BE", "fr-CA", "fr-FR", "fr-CH"]),
-            (L10nDE.strings, ["de-AT", "de-DE", "de-CH"]),
-            (L10nES.strings, [
+        let aliases: [(provider: TableProvider, codes: [String])] = [
+            ({ L10nEN.strings }, ["en-AU", "en-CA", "en-IN", "en-IE", "en-NZ", "en-SG", "en-ZA", "en-GB", "en-US"]),
+            ({ L10nFR.strings }, ["fr-BE", "fr-CA", "fr-FR", "fr-CH"]),
+            ({ L10nDE.strings }, ["de-AT", "de-DE", "de-CH"]),
+            ({ L10nES.strings }, [
                 "es-AR", "es-BO", "es-CL", "es-CO", "es-CR", "es-DO", "es-EC",
                 "es-SV", "es-GT", "es-HN", "es-419", "es-MX", "es-NI", "es-PA",
                 "es-PY", "es-PE", "es-PR", "es-ES", "es-US", "es-UY", "es-VE",
             ]),
-            (L10nIT.strings, ["it-IT", "it-CH"]),
-            (L10nPTBR.strings, ["pt-BR"]),
-            (L10nPTPT.strings, ["pt-PT"]),
-            (L10nNL.strings, ["nl-BE", "nl-NL"]),
-            (L10nZHHans.strings, ["zh-Hans-CN", "zh-Hans"]),
-            (L10nZHHant.strings, ["zh-Hant-HK", "zh-Hant-MO", "zh-Hant-TW", "zh-Hant"]),
+            ({ L10nIT.strings }, ["it-IT", "it-CH"]),
+            ({ L10nPTBR.strings }, ["pt-BR"]),
+            ({ L10nPTPT.strings }, ["pt-PT"]),
+            ({ L10nNL.strings }, ["nl-BE", "nl-NL"]),
+            ({ L10nZHHans.strings }, ["zh-Hans-CN", "zh-Hans"]),
+            ({ L10nZHHant.strings }, ["zh-Hant-HK", "zh-Hant-MO", "zh-Hant-TW", "zh-Hant"]),
         ]
 
         for alias in aliases {
             for code in alias.codes {
-                tables[code] = alias.table
+                providers[code] = alias.provider
             }
         }
 
-        return tables
+        return providers
     }()
 
     private static let fallbackLocaleCode = "en"
+    private static let activeTable = tableProvidersByLocale[localeCode]?() ?? L10nEN.strings
+    private static let fallbackTable = L10nEN.strings
 
     static var localeCode: String {
         guard let preferred = Locale.preferredLanguages.first else { return fallbackLocaleCode }
         let canonical = canonicalTVOSLanguageIdentifier(for: preferred)
-        return tablesByLocale[canonical] != nil ? canonical : fallbackLocaleCode
+        return tableProvidersByLocale[canonical] != nil ? canonical : fallbackLocaleCode
     }
 
     static func text(_ key: String) -> String {
-        tablesByLocale[localeCode]?[key] ?? tablesByLocale[fallbackLocaleCode]?[key] ?? key
+        activeTable[key] ?? fallbackTable[key] ?? key
     }
 
     static func format(_ key: String, _ args: CVarArg...) -> String {
@@ -129,14 +135,6 @@ enum L10n {
         }
     }
 
-    static func hdrSupportLabel(_ support: HDRSupport) -> String {
-        switch support {
-        case .supported: text("supported")
-        case .unsupported: text("unsupported")
-        case .unknown: text("unknown")
-        }
-    }
-
     static func colorFallbackReasonLabel(_ reason: ColorFallbackReason) -> String {
         switch reason {
         case .gameHDRUnknown: text("game_hdr_unknown")
@@ -153,14 +151,6 @@ enum L10n {
         case .unsupportedPixelFormat: text("unsupported_pixel_format")
         case .unstablePlayback: text("unstable_playback")
         case .sessionNegotiationFailed: text("session_negotiation_failed")
-        }
-    }
-
-    static func decoderPathLabel(_ path: VideoDecoderPath) -> String {
-        switch path {
-        case .hardware: text("hardware")
-        case .softwareI420: text("software_i420")
-        case .unknown: text("unknown")
         }
     }
 
@@ -188,46 +178,6 @@ enum L10n {
             parts.append(text("no_content_light_metadata"))
         }
         return parts.isEmpty ? text("metadata_complete") : parts.joined(separator: " · ")
-    }
-
-    static func diagnosticSessionSummary(
-        sessionIdPrefix: String,
-        serverIp: String,
-        resolution: String,
-        fps: Int,
-        codec: String
-    ) -> String {
-        format("diagnostic_session_summary", sessionIdPrefix, serverIp, resolution, fps, codec)
-    }
-
-    static func displayLayerMetrics(
-        totalFrames: Int,
-        droppedFrames: Int,
-        corruptedFrames: Int,
-        accumulatedFrameDelayMs: Double
-    ) -> String {
-        format("display_layer_metrics", totalFrames, droppedFrames, corruptedFrames, accumulatedFrameDelayMs)
-    }
-
-    static func colorDiagnosticStatus(
-        preference: String,
-        requested: String,
-        detected: String,
-        display: String
-    ) -> String {
-        format("color_diagnostic_status", preference, requested, detected, display)
-    }
-
-    static func decodedVideoStatus(
-        decoderPath: String,
-        mode: String,
-        width: Int,
-        height: Int,
-        pixelFormatName: String,
-        bitDepth: String,
-        metadataSummary: String
-    ) -> String {
-        format("decoded_video_status", decoderPath, mode, width, height, pixelFormatName, bitDepth, metadataSummary)
     }
 
     static func videoCodecLabel(_ codec: VideoCodec) -> String {
@@ -272,15 +222,15 @@ enum L10n {
     }
 
     static func controllerButtonSequenceLabel(_ sequence: ControllerButtonSequence) -> String {
-        let labels = sequence.buttons.map(controllerSequenceButtonLabel)
+        let labels = sequence.buttons.map { controllerSequenceButtonLabel($0) }
         return labels.isEmpty ? text("not_set") : labels.joined(separator: " + ")
     }
 
     static func remoteInputModeLabel(_ mode: RemoteInputMode) -> String {
         switch mode {
-        case .mouse: text("remote_mouse")
         case .gamepad: text("remote_gamepad")
         case .dualsense: text("remote_touchpad")
+        case .gamepadMouse: text("remote_gamepad_mouse")
         }
     }
 
@@ -309,11 +259,11 @@ enum L10n {
         return host.components(separatedBy: ".").first?.uppercased() ?? zoneUrl
     }
 
-    static func nvidiaLocaleCode(for locale: Locale = .autoupdatingCurrent) -> String {
+    nonisolated static func nvidiaLocaleCode(for locale: Locale = .autoupdatingCurrent) -> String {
         nvidiaLocaleCode(forTVOSLanguageIdentifier: tvOSLanguageIdentifier(for: locale))
     }
 
-    static func tvOSLanguageIdentifier(for locale: Locale = .autoupdatingCurrent) -> String {
+    nonisolated static func tvOSLanguageIdentifier(for locale: Locale = .autoupdatingCurrent) -> String {
         let language = locale.language.languageCode?.identifier.lowercased() ?? "en"
         let region = locale.region?.identifier.uppercased()
         let identifier = locale.identifier.lowercased()
@@ -435,7 +385,7 @@ enum L10n {
         }
     }
 
-    static func nvidiaLocaleCode(forTVOSLanguageIdentifier identifier: String) -> String {
+    nonisolated static func nvidiaLocaleCode(forTVOSLanguageIdentifier identifier: String) -> String {
         let locale = Locale(identifier: identifier.replacingOccurrences(of: "_", with: "-"))
         let language = locale.language.languageCode?.identifier.lowercased() ?? "en"
         let region = locale.region?.identifier.uppercased()
@@ -544,7 +494,7 @@ enum L10n {
         return tvOSLanguageIdentifier(for: locale)
     }
 
-    static func keyboardLayoutCode(for locale: Locale = .autoupdatingCurrent) -> String {
+    nonisolated static func keyboardLayoutCode(for locale: Locale = .autoupdatingCurrent) -> String {
         nvidiaLocaleCode(for: locale).replacingOccurrences(of: "_", with: "-")
     }
 
