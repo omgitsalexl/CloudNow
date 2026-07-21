@@ -704,6 +704,7 @@ struct SettingsView: View {
             .navigationTitle(L10n.text("capture_text_input_buttons"))
             .defaultFocus($focusedControl, .startListening)
             .onExitCommand {
+                guard !isCapturing else { return }
                 dismiss()
             }
             .task(id: isCapturing) {
