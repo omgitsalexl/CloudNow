@@ -388,8 +388,7 @@ struct StreamView: View {
             .animation(.easeInOut(duration: 0.2), value: overlayState)
             .animation(.easeInOut(duration: 0.2), value: streamController.statsMode)
             .onChange(of: overlayState) { _, state in
-                let shouldPause = state == .textEntry
-                    || (state == .pauseMenu && streamController.remoteMode != .gamepadMouse)
+                let shouldPause = state != .none
                 streamController.setOverlayInputPaused(shouldPause)
                 textEntryFocus = state == .textEntry ? .field : nil
             }
